@@ -1,6 +1,8 @@
 #!/usr/bin/env sh
-# Builds and runs the Tests/Io package and asserts its output, verifying the
-# linker's I/O thunks (GetStdHandle / WriteConsoleW) end-to-end.
+# Builds and runs the I/O thunk test packages and asserts their behavior,
+# verifying the linker's OS-interaction thunks end-to-end:
+#   - Tests/Io   : GetStdHandle + WriteConsoleW (stdout)
+#   - Tests/Echo : GetStdHandle + ReadFile + WriteConsoleW (stdin round-trip)
 #
 # Usage:
 #   Tests/run_io_test.sh [path-to-rux]
@@ -11,7 +13,6 @@
 set -eu
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
-PKG="$SCRIPT_DIR/Io"
 
 RUX="${RUX:-${1:-}}"
 if [ -z "$RUX" ]; then
@@ -31,30 +32,59 @@ if [ -z "$RUX" ]; then
     echo "error: rux binary not found; set RUX or pass it as the first argument" >&2
     exit 2
 fi
-
 echo "Using rux: $RUX"
-( cd "$PKG" && "$RUX" build >/dev/null )
 
-BIN="$PKG/Bin/Debug/io_test"
-[ -f "$BIN" ] || BIN="$BIN.exe"
-if [ ! -f "$BIN" ]; then
-    echo "error: built executable not found at $BIN" >&2
-    exit 2
+# Builds the package in $1 and prints the path to its executable on stdout.
+build_pkg() {
+    pkg="$SCRIPT_DIR/$1"
+    name="$2"
+    ( cd "$pkg" && "$RUX" build >/dev/null )
+    bin="$pkg/Bin/Debug/$name"
+    [ -f "$bin" ] || bin="$bin.exe"
+    if [ ! -f "$bin" ]; then
+        echo "error: built executable not found at $bin" >&2
+        exit 2
+    fi
+    printf '%s' "$bin"
+}
+
+failures=0
+
+# 1. stdout test: WriteConsoleW + GetStdHandle.
+IO_BIN=$(build_pkg "Io" "io_test")
+IO_EXPECTED="Hello from a Rux binary via I/O thunks!"
+set +e
+IO_ACTUAL=$("$IO_BIN")
+IO_CODE=$?
+set -e
+if [ "$IO_ACTUAL" = "$IO_EXPECTED" ] && [ "$IO_CODE" -eq 0 ]; then
+    echo "PASS: stdout thunks (Tests/Io)"
+else
+    echo "FAIL: stdout thunks (Tests/Io)" >&2
+    echo "  expected: [$IO_EXPECTED] (exit 0)" >&2
+    echo "  actual:   [$IO_ACTUAL] (exit $IO_CODE)" >&2
+    failures=$((failures + 1))
 fi
 
-EXPECTED="Hello from a Rux binary via I/O thunks!"
-
+# 2. stdin round-trip: ReadFile + WriteConsoleW + GetStdHandle.
+ECHO_BIN=$(build_pkg "Echo" "echo_test")
+ECHO_INPUT="round-trip via stdin thunks"
 set +e
-ACTUAL=$("$BIN")
-CODE=$?
+ECHO_ACTUAL=$(printf '%s' "$ECHO_INPUT" | "$ECHO_BIN")
+ECHO_CODE=$?
 set -e
+if [ "$ECHO_ACTUAL" = "$ECHO_INPUT" ] && [ "$ECHO_CODE" -eq 0 ]; then
+    echo "PASS: stdin round-trip (Tests/Echo)"
+else
+    echo "FAIL: stdin round-trip (Tests/Echo)" >&2
+    echo "  sent:     [$ECHO_INPUT]" >&2
+    echo "  received: [$ECHO_ACTUAL] (exit $ECHO_CODE)" >&2
+    failures=$((failures + 1))
+fi
 
-if [ "$ACTUAL" = "$EXPECTED" ] && [ "$CODE" -eq 0 ]; then
-    echo "PASS: I/O thunks produced the expected output"
+if [ "$failures" -eq 0 ]; then
+    echo "All I/O thunk tests passed"
     exit 0
 fi
-
-echo "FAIL: I/O thunk test mismatch" >&2
-echo "  expected: [$EXPECTED] (exit 0)" >&2
-echo "  actual:   [$ACTUAL] (exit $CODE)" >&2
+echo "$failures I/O thunk test(s) failed" >&2
 exit 1
