@@ -913,6 +913,27 @@ namespace Rux {
                  0x31, 0xC0, // xor eax, eax (FALSE)
                  0xC3 // ret
              }},
+            // WriteFile(handle, buf, count, *bytesWritten, overlapped) -> write(fd, buf, count).
+            // Same shape as ReadFile; only the syscall number differs.
+            {"WriteFile",
+             {
+                 0x89, 0xCF, // mov edi, ecx  (fd)
+                 0x48, 0x89, 0xD6, // mov rsi, rdx  (buf)
+                 0x4C, 0x89, 0xC2, // mov rdx, r8   (count)
+#  if defined(__FreeBSD__)
+                 0xB8, 0x04, 0x00, 0x00, 0x00, // mov eax, 4 (SYS_write)
+#  else
+                 0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1 (SYS_write)
+#  endif
+                 0x0F, 0x05, // syscall
+                 0x85, 0xC0, // test eax, eax
+                 0x78, 0x09, // js +9 (error)
+                 0x41, 0x89, 0x01, // mov [r9], eax  (*bytesWritten = result)
+                 0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1 (TRUE)
+                 0xC3, // ret
+                 0x31, 0xC0, // xor eax, eax (FALSE)
+                 0xC3 // ret
+             }},
 #  if defined(__linux__)
             // Rux extern calls currently use the Win64 register layout. These
             // thunks move that layout into Linux x86_64 syscall registers:
@@ -1416,6 +1437,22 @@ namespace Rux {
                  0x0F, 0x05, // syscall
                  0x72, 0x09, // jc +9 (error)
                  0x41, 0x89, 0x01, // mov [r9], eax (*bytesRead = result)
+                 0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1 (TRUE)
+                 0xC3, // ret
+                 0x31, 0xC0, // xor eax, eax (FALSE)
+                 0xC3 // ret
+             }},
+            // WriteFile(handle, buf, count, *bytesWritten, overlapped) -> write(fd, buf, count).
+            // Same shape as ReadFile; SYS_write instead of SYS_read.
+            {"WriteFile",
+             {
+                 0x89, 0xCF, // mov edi, ecx (fd)
+                 0x48, 0x89, 0xD6, // mov rsi, rdx (buf)
+                 0x4C, 0x89, 0xC2, // mov rdx, r8  (count)
+                 0xB8, 0x04, 0x00, 0x00, 0x02, // mov eax, 0x2000004 (SYS_write)
+                 0x0F, 0x05, // syscall
+                 0x72, 0x09, // jc +9 (error)
+                 0x41, 0x89, 0x01, // mov [r9], eax (*bytesWritten = result)
                  0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1 (TRUE)
                  0xC3, // ret
                  0x31, 0xC0, // xor eax, eax (FALSE)
