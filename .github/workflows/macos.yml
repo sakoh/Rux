@@ -8,15 +8,11 @@ on:
 
 jobs:
   build-and-test:
-    name: build-and-test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        # macos-13 is Intel (x86-64); macos-14 is Apple Silicon (arm64).
-        # Rux emits x86-64 Mach-O executables, so on arm64 the produced
-        # test binaries run through Rosetta 2 (installed below).
-        os: [macos-13, macos-14]
+    # macos-14 is Apple Silicon (arm64). Rux emits x86-64 Mach-O executables,
+    # so the produced test binaries run through Rosetta 2 (installed below).
+    # (Intel macos-13 runners are scarce/being retired and queue indefinitely,
+    # so we don't gate CI on them; the Rosetta path exercises the same output.)
+    runs-on: macos-14
 
     steps:
       - uses: actions/checkout@v4
@@ -25,8 +21,7 @@ jobs:
       - name: Install toolchain
         run: brew install llvm cmake ninja
 
-      - name: Install Rosetta 2 (Apple Silicon only)
-        if: matrix.os == 'macos-14'
+      - name: Install Rosetta 2
         run: softwareupdate --install-rosetta --agree-to-license
 
       - name: Configure
