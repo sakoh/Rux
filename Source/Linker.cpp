@@ -23,6 +23,13 @@
 #  include <filesystem>
 #endif
 
+#if defined(_WIN32)
+// NOMINMAX: keep windows.h from defining min/max macros that would clobber the
+// std::max/std::min calls in the PE linker below.
+#  define NOMINMAX
+#  include <windows.h>
+#endif
+
 namespace Rux {
     // PE32+ layout constants
     [[maybe_unused]] static constexpr uint64_t kImageBase = 0x140000000ULL;
@@ -243,6 +250,20 @@ namespace Rux {
         }
 
         if (FileExists(std::filesystem::current_path() / dllPath)) return std::filesystem::current_path() / dllPath;
+
+#if defined(_WIN32)
+        // System DLLs (kernel32, user32, ...) live in the Windows system
+        // directory, which is the authoritative source for them — don't rely on
+        // it happening to be on PATH (it isn't under some shells, e.g. Git Bash).
+        {
+            wchar_t sysDir[MAX_PATH];
+            const UINT len = GetSystemDirectoryW(sysDir, MAX_PATH);
+            if (len > 0 && len < MAX_PATH) {
+                const std::filesystem::path candidate = std::filesystem::path(std::wstring(sysDir, len)) / dllPath;
+                if (FileExists(candidate)) return candidate;
+            }
+        }
+#endif
 
         const std::string pathEnv = GetPathEnv();
         if (pathEnv.empty()) return std::nullopt;
