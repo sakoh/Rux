@@ -243,13 +243,27 @@ namespace Rux {
         if (dllPath.is_absolute())
             return FileExists(dllPath) ? std::optional<std::filesystem::path>(dllPath) : std::nullopt;
 
-        if (!outputDir.empty() && FileExists(outputDir / dllPath)) return outputDir / dllPath;
+        // Candidate file names to probe in each search location. Imports are
+        // commonly declared without an extension (e.g. @[Import(lib: "kernel32")]);
+        // mirror the OS loader and also try the name with ".dll" appended.
+        std::vector<std::filesystem::path> candidates{dllPath};
+        if (dllPath.extension().empty()) candidates.emplace_back(dll + ".dll");
 
-        for (const auto& dir : searchDirs) {
-            if (!dir.empty() && FileExists(dir / dllPath)) return dir / dllPath;
-        }
+        const auto probe =
+            [&](const std::filesystem::path& dir) -> std::optional<std::filesystem::path> {
+            if (dir.empty()) return std::nullopt;
+            for (const auto& name : candidates) {
+                if (FileExists(dir / name)) return dir / name;
+            }
+            return std::nullopt;
+        };
 
-        if (FileExists(std::filesystem::current_path() / dllPath)) return std::filesystem::current_path() / dllPath;
+        if (auto hit = probe(outputDir)) return hit;
+
+        for (const auto& dir : searchDirs)
+            if (auto hit = probe(dir)) return hit;
+
+        if (auto hit = probe(std::filesystem::current_path())) return hit;
 
 #if defined(_WIN32)
         // System DLLs (kernel32, user32, ...) live in the Windows system
@@ -258,10 +272,8 @@ namespace Rux {
         {
             wchar_t sysDir[MAX_PATH];
             const UINT len = GetSystemDirectoryW(sysDir, MAX_PATH);
-            if (len > 0 && len < MAX_PATH) {
-                const std::filesystem::path candidate = std::filesystem::path(std::wstring(sysDir, len)) / dllPath;
-                if (FileExists(candidate)) return candidate;
-            }
+            if (len > 0 && len < MAX_PATH)
+                if (auto hit = probe(std::filesystem::path(std::wstring(sysDir, len)))) return hit;
         }
 #endif
 
@@ -270,10 +282,8 @@ namespace Rux {
 
         std::stringstream ss(pathEnv);
         std::string dir;
-        while (std::getline(ss, dir, ';')) {
-            if (!dir.empty() && FileExists(std::filesystem::path(dir) / dllPath))
-                return std::filesystem::path(dir) / dllPath;
-        }
+        while (std::getline(ss, dir, ';'))
+            if (auto hit = probe(std::filesystem::path(dir))) return hit;
 
         return std::nullopt;
     }
