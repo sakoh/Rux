@@ -10,11 +10,11 @@ jobs:
   build-and-test:
     # windows-latest is x86-64, so Rux's PE32+ backend emits executables that
     # run natively here. The I/O thunks resolve against the real GetStdHandle /
-    # WriteConsoleW / ReadFile imports.
+    # WriteFile / ReadFile imports.
     runs-on: windows-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # CMakeLists requires CMake >= 3.31; pull a known-recent CMake + Ninja
       # rather than relying on whatever ships on the runner image.
