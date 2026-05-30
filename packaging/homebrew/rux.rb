@@ -31,9 +31,9 @@ class Rux < Formula
     assert_match "Rux", shell_output("#{bin}/rux --version")
 
     # End-to-end: compile a trivial package, confirming the Mach-O backend
-    # produces an executable. `rux build` operates on the current directory,
-    # so the package must be the cwd. (Produced binaries are x86-64 and run
-    # via Rosetta 2 on Apple Silicon.)
+    # produces a working executable. `rux build` operates on the current
+    # directory, so the package must be the cwd. The output architecture
+    # matches the host: native arm64 on Apple Silicon, x86-64 on Intel.
     (testpath/"Rux.toml").write <<~TOML
       [Package]
       Name    = "hello"
@@ -50,5 +50,9 @@ class Rux < Formula
     RUX
     system bin/"rux", "build"
     assert_predicate testpath/"Bin/Debug/hello", :exist?
+
+    # The produced executable runs natively on the host and exits 0. On Apple
+    # Silicon this exercises the native arm64 backend directly (no Rosetta 2).
+    system testpath/"Bin/Debug/hello"
   end
 end
