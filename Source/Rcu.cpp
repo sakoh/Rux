@@ -2835,6 +2835,1410 @@ namespace Rux {
             return file;
         }
 
+        // ============================================================
+        // AArch64 (Apple Silicon) backend
+        // ============================================================
+        //
+        // Mirrors the x86-64 RcuCodeGen but emits native ARM64 machine code.
+        // Same naive model: every virtual register is spilled to a stack slot
+        // at [x29 - slot]; values are loaded into fixed scratch registers,
+        // operated on, and stored back. The ABI is AAPCS64 throughout (the
+        // self-contained linker provides matching syscall thunks), so there is
+        // no Win64/System-V split here.
+        //
+        // Register conventions:
+        //   x9  = integer accumulator A     v0/d0/s0 = float accumulator A
+        //   x10 = integer accumulator B     v1/d1/s1 = float accumulator B
+        //   x16 = address scratch (slot/operand addressing)
+        //   x17 = pointer-base scratch (Load/Store through a pointer)
+        //   x0-x7 / d0-d7 = AAPCS64 argument & return registers
+        namespace A64 {
+            // Condition codes
+            enum Cond : uint8_t {
+                EQ = 0, NE = 1, CS = 2, CC = 3, MI = 4, PL = 5, VS = 6, VC = 7,
+                HI = 8, LS = 9, GE = 10, LT = 11, GT = 12, LE = 13, AL = 14,
+            };
+
+            constexpr uint8_t kAReg = 9; // x9
+            constexpr uint8_t kBReg = 10; // x10
+            constexpr uint8_t kAddr = 16; // x16
+            constexpr uint8_t kPtr = 17; // x17
+            constexpr uint8_t kFP = 29; // x29
+            constexpr uint8_t kSP = 31; // sp / xzr (context-dependent)
+        } // namespace A64
+
+        // 32-bit-word little-endian AArch64 encoder.
+        class Arm64Enc {
+        public:
+            explicit Arm64Enc(std::vector<uint8_t>& buf)
+                : out_(buf) {
+            }
+
+            [[nodiscard]] uint32_t Size() const {
+                return static_cast<uint32_t>(out_.size());
+            }
+
+            void W(uint32_t w) const {
+                out_.push_back(w & 0xFF);
+                out_.push_back((w >> 8) & 0xFF);
+                out_.push_back((w >> 16) & 0xFF);
+                out_.push_back((w >> 24) & 0xFF);
+            }
+
+            void PatchW(uint32_t off, uint32_t w) const {
+                out_[off] = w & 0xFF;
+                out_[off + 1] = (w >> 8) & 0xFF;
+                out_[off + 2] = (w >> 16) & 0xFF;
+                out_[off + 3] = (w >> 24) & 0xFF;
+            }
+
+            // Immediate moves
+            void Movz(uint8_t rd, uint16_t imm, uint8_t hw) const {
+                W(0xD2800000u | (static_cast<uint32_t>(hw) << 21) | (static_cast<uint32_t>(imm) << 5) | rd);
+            }
+            void Movk(uint8_t rd, uint16_t imm, uint8_t hw) const {
+                W(0xF2800000u | (static_cast<uint32_t>(hw) << 21) | (static_cast<uint32_t>(imm) << 5) | rd);
+            }
+            void Movn(uint8_t rd, uint16_t imm, uint8_t hw) const {
+                W(0x92800000u | (static_cast<uint32_t>(hw) << 21) | (static_cast<uint32_t>(imm) << 5) | rd);
+            }
+            void MovImm64(uint8_t rd, uint64_t v) const {
+                Movz(rd, static_cast<uint16_t>(v & 0xFFFF), 0);
+                if ((v >> 16) & 0xFFFF) Movk(rd, static_cast<uint16_t>((v >> 16) & 0xFFFF), 1);
+                if ((v >> 32) & 0xFFFF) Movk(rd, static_cast<uint16_t>((v >> 32) & 0xFFFF), 2);
+                if ((v >> 48) & 0xFFFF) Movk(rd, static_cast<uint16_t>((v >> 48) & 0xFFFF), 3);
+            }
+            // orr rd, xzr, rm
+            void MovReg(uint8_t rd, uint8_t rm) const {
+                W(0xAA0003E0u | (static_cast<uint32_t>(rm) << 16) | rd);
+            }
+
+            // Add/sub immediate (rn may be sp via reg 31)
+            void AddImm(uint8_t rd, uint8_t rn, uint32_t imm12, uint8_t sh = 0) const {
+                W(0x91000000u | (static_cast<uint32_t>(sh) << 22) | ((imm12 & 0xFFF) << 10) |
+                  (static_cast<uint32_t>(rn) << 5) | rd);
+            }
+            void SubImm(uint8_t rd, uint8_t rn, uint32_t imm12, uint8_t sh = 0) const {
+                W(0xD1000000u | (static_cast<uint32_t>(sh) << 22) | ((imm12 & 0xFFF) << 10) |
+                  (static_cast<uint32_t>(rn) << 5) | rd);
+            }
+
+            // Arithmetic / logical (register, 64-bit)
+            void AddReg(uint8_t rd, uint8_t rn, uint8_t rm) const { RRR(0x8B000000u, rd, rn, rm); }
+            void SubReg(uint8_t rd, uint8_t rn, uint8_t rm) const { RRR(0xCB000000u, rd, rn, rm); }
+            void AndReg(uint8_t rd, uint8_t rn, uint8_t rm) const { RRR(0x8A000000u, rd, rn, rm); }
+            void OrrReg(uint8_t rd, uint8_t rn, uint8_t rm) const { RRR(0xAA000000u, rd, rn, rm); }
+            void EorReg(uint8_t rd, uint8_t rn, uint8_t rm) const { RRR(0xCA000000u, rd, rn, rm); }
+            void MulReg(uint8_t rd, uint8_t rn, uint8_t rm) const { RRR(0x9B007C00u, rd, rn, rm); }
+            void SdivReg(uint8_t rd, uint8_t rn, uint8_t rm) const { RRR(0x9AC00C00u, rd, rn, rm); }
+            void UdivReg(uint8_t rd, uint8_t rn, uint8_t rm) const { RRR(0x9AC00800u, rd, rn, rm); }
+            void LslvReg(uint8_t rd, uint8_t rn, uint8_t rm) const { RRR(0x9AC02000u, rd, rn, rm); }
+            void LsrvReg(uint8_t rd, uint8_t rn, uint8_t rm) const { RRR(0x9AC02400u, rd, rn, rm); }
+            void AsrvReg(uint8_t rd, uint8_t rn, uint8_t rm) const { RRR(0x9AC02800u, rd, rn, rm); }
+            // msub rd = ra - rn*rm
+            void Msub(uint8_t rd, uint8_t rn, uint8_t rm, uint8_t ra) const {
+                W(0x9B008000u | (static_cast<uint32_t>(rm) << 16) | (static_cast<uint32_t>(ra) << 10) |
+                  (static_cast<uint32_t>(rn) << 5) | rd);
+            }
+            void NegReg(uint8_t rd, uint8_t rm) const {
+                W(0xCB0003E0u | (static_cast<uint32_t>(rm) << 16) | rd);
+            }
+            void MvnReg(uint8_t rd, uint8_t rm) const {
+                W(0xAA2003E0u | (static_cast<uint32_t>(rm) << 16) | rd);
+            }
+            void Sxtb(uint8_t rd, uint8_t rn) const { W(0x93401C00u | (static_cast<uint32_t>(rn) << 5) | rd); }
+            void Sxth(uint8_t rd, uint8_t rn) const { W(0x93403C00u | (static_cast<uint32_t>(rn) << 5) | rd); }
+            void Sxtw(uint8_t rd, uint8_t rn) const { W(0x93407C00u | (static_cast<uint32_t>(rn) << 5) | rd); }
+
+            // Compare / conditional set
+            void CmpImm(uint8_t rn, uint32_t imm12) const {
+                W(0xF100001Fu | ((imm12 & 0xFFF) << 10) | (static_cast<uint32_t>(rn) << 5));
+            }
+            void CmpReg(uint8_t rn, uint8_t rm) const {
+                W(0xEB00001Fu | (static_cast<uint32_t>(rm) << 16) | (static_cast<uint32_t>(rn) << 5));
+            }
+            void Cset(uint8_t rd, uint8_t cond) const {
+                W(0x9A9F07E0u | (static_cast<uint32_t>(cond ^ 1) << 12) | rd);
+            }
+
+            // Loads / stores (unsigned scaled immediate offset)
+            void LdrX(uint8_t rt, uint8_t rn, uint32_t imm) const { LS(0xF9400000u, rt, rn, imm); }
+            void StrX(uint8_t rt, uint8_t rn, uint32_t imm) const { LS(0xF9000000u, rt, rn, imm); }
+            void LdrW(uint8_t rt, uint8_t rn, uint32_t imm) const { LS(0xB9400000u, rt, rn, imm); }
+            void StrW(uint8_t rt, uint8_t rn, uint32_t imm) const { LS(0xB9000000u, rt, rn, imm); }
+            void LdrhW(uint8_t rt, uint8_t rn, uint32_t imm) const { LS(0x79400000u, rt, rn, imm); }
+            void StrhW(uint8_t rt, uint8_t rn, uint32_t imm) const { LS(0x79000000u, rt, rn, imm); }
+            void LdrbW(uint8_t rt, uint8_t rn, uint32_t imm) const { LS(0x39400000u, rt, rn, imm); }
+            void StrbW(uint8_t rt, uint8_t rn, uint32_t imm) const { LS(0x39000000u, rt, rn, imm); }
+            void LdrD(uint8_t vt, uint8_t rn, uint32_t imm) const { LS(0xFD400000u, vt, rn, imm); }
+            void StrD(uint8_t vt, uint8_t rn, uint32_t imm) const { LS(0xFD000000u, vt, rn, imm); }
+            void LdrS(uint8_t vt, uint8_t rn, uint32_t imm) const { LS(0xBD400000u, vt, rn, imm); }
+            void StrS(uint8_t vt, uint8_t rn, uint32_t imm) const { LS(0xBD000000u, vt, rn, imm); }
+
+            // Floating point (operate on d/s registers)
+            void Fadd(bool f32, uint8_t vd, uint8_t vn, uint8_t vm) const { FR(f32 ? 0x1E202800u : 0x1E602800u, vd, vn, vm); }
+            void Fsub(bool f32, uint8_t vd, uint8_t vn, uint8_t vm) const { FR(f32 ? 0x1E203800u : 0x1E603800u, vd, vn, vm); }
+            void Fmul(bool f32, uint8_t vd, uint8_t vn, uint8_t vm) const { FR(f32 ? 0x1E200800u : 0x1E600800u, vd, vn, vm); }
+            void Fdiv(bool f32, uint8_t vd, uint8_t vn, uint8_t vm) const { FR(f32 ? 0x1E201800u : 0x1E601800u, vd, vn, vm); }
+            void Fneg(bool f32, uint8_t vd, uint8_t vn) const {
+                W((f32 ? 0x1E214000u : 0x1E614000u) | (static_cast<uint32_t>(vn) << 5) | vd);
+            }
+            void Fcmp(bool f32, uint8_t vn, uint8_t vm) const {
+                W((f32 ? 0x1E202000u : 0x1E602000u) | (static_cast<uint32_t>(vm) << 16) |
+                  (static_cast<uint32_t>(vn) << 5));
+            }
+            void Scvtf(bool f32, uint8_t vd, uint8_t xn) const {
+                W((f32 ? 0x9E220000u : 0x9E620000u) | (static_cast<uint32_t>(xn) << 5) | vd);
+            }
+            void Fcvtzs(bool f32, uint8_t xd, uint8_t vn) const {
+                W((f32 ? 0x9E380000u : 0x9E780000u) | (static_cast<uint32_t>(vn) << 5) | xd);
+            }
+            void FcvtD2S(uint8_t sd, uint8_t dn) const { W(0x1E624000u | (static_cast<uint32_t>(dn) << 5) | sd); }
+            void FcvtS2D(uint8_t dd, uint8_t sn) const { W(0x1E22C000u | (static_cast<uint32_t>(sn) << 5) | dd); }
+
+            // PC-relative address formation (patched by the linker)
+            void AdrpBase(uint8_t rd) const { W(0x90000000u | rd); }
+            void AddLo12Base(uint8_t rd, uint8_t rn) const {
+                W(0x91000000u | (static_cast<uint32_t>(rn) << 5) | rd);
+            }
+
+            // Control flow. Branch instructions return their word offset so the
+            // generator can back-patch the displacement once block layout is known.
+            uint32_t EmitB() const { uint32_t o = Size(); W(0x14000000u); return o; }
+            uint32_t EmitBcond(uint8_t cond) const { uint32_t o = Size(); W(0x54000000u | cond); return o; }
+            uint32_t EmitBl() const { uint32_t o = Size(); W(0x94000000u); return o; }
+            void Blr(uint8_t rn) const { W(0xD63F0000u | (static_cast<uint32_t>(rn) << 5)); }
+            void Ret() const { W(0xD65F03C0u); }
+
+            void PatchB(uint32_t off, int32_t dispBytes) const {
+                PatchW(off, 0x14000000u | ((static_cast<uint32_t>(dispBytes >> 2)) & 0x3FFFFFFu));
+            }
+            void PatchBcond(uint32_t off, uint8_t cond, int32_t dispBytes) const {
+                PatchW(off,
+                       0x54000000u | ((static_cast<uint32_t>(dispBytes >> 2) & 0x7FFFFu) << 5) | cond);
+            }
+
+            // Prologue/epilogue fixed encodings
+            void StpFpLrPre() const { W(0xA9BF7BFDu); } // stp x29, x30, [sp, #-16]!
+            void LdpFpLrPost() const { W(0xA8C17BFDu); } // ldp x29, x30, [sp], #16
+            void MovFpSp() const { W(0x910003FDu); } // mov x29, sp
+            void MovSpFp() const { W(0x910003BFu); } // mov sp, x29
+
+        private:
+            std::vector<uint8_t>& out_;
+
+            void RRR(uint32_t base, uint8_t rd, uint8_t rn, uint8_t rm) const {
+                W(base | (static_cast<uint32_t>(rm) << 16) | (static_cast<uint32_t>(rn) << 5) | rd);
+            }
+            void LS(uint32_t base, uint8_t rt, uint8_t rn, uint32_t imm) const {
+                W(base | ((imm & 0xFFF) << 10) | (static_cast<uint32_t>(rn) << 5) | rt);
+            }
+            void FR(uint32_t base, uint8_t vd, uint8_t vn, uint8_t vm) const {
+                W(base | (static_cast<uint32_t>(vm) << 16) | (static_cast<uint32_t>(vn) << 5) | vd);
+            }
+        };
+
+        struct Arm64JumpPatch {
+            uint32_t patchOff;
+            uint32_t targetBlock;
+            bool conditional;
+            uint8_t cond;
+        };
+
+        // RCU Code Generator (ARM64): LirModule → RcuFile
+        class Arm64CodeGen {
+        public:
+            explicit Arm64CodeGen(const LirModule& mod,
+                                  const std::vector<LirStructDecl>& structDecls,
+                                  const std::vector<std::string>& packageInterfaceNames,
+                                  std::string pkgName)
+                : mod(mod)
+                , structDecls(structDecls)
+                , packageInterfaceNames(packageInterfaceNames)
+                , pkgName(std::move(pkgName))
+                , enc(textData) {
+            }
+
+            RcuFile Generate();
+
+        private:
+            const LirModule& mod;
+            const std::vector<LirStructDecl>& structDecls;
+            const std::vector<std::string>& packageInterfaceNames;
+            std::string pkgName;
+
+            std::vector<uint8_t> textData;
+            std::vector<uint8_t> rodataData;
+            std::vector<uint8_t> dataData;
+            std::vector<RcuReloc> textRelocs;
+            std::vector<RcuReloc> rodataRelocs;
+            std::vector<RcuSymbol> symbols;
+
+            Arm64Enc enc;
+
+            std::unordered_map<std::string, uint32_t> strSyms;
+            std::unordered_map<std::string, uint32_t> f32Syms;
+            std::unordered_map<std::string, uint32_t> f64Syms;
+            int constIdx = 0;
+            uint32_t f32SignMaskSym = ~0u;
+            uint32_t f64SignMaskSym = ~0u;
+
+            std::unordered_map<std::string, uint32_t> externSyms;
+            std::unordered_map<std::string, uint32_t> funcSyms;
+            std::unordered_map<std::string, uint32_t> dataSyms;
+            uint32_t ipowSym = ~0u;
+
+            struct FieldLayout {
+                std::string name;
+                int offset = 0;
+                int size = 0;
+            };
+            struct StructLayout {
+                std::vector<FieldLayout> fields;
+                int totalSize = 0;
+                int alignment = 1;
+            };
+            std::unordered_map<std::string, StructLayout> layouts;
+            std::unordered_set<std::string> interfaceNames;
+
+            struct PhiMove {
+                LirReg dst;
+                LirReg src;
+                TypeRef type;
+            };
+            std::unordered_map<LirReg, int32_t> slotMap;
+            std::unordered_map<LirReg, int32_t> allocaData;
+            std::unordered_map<LirReg, TypeRef> regTypes;
+            std::unordered_map<uint32_t, std::unordered_map<uint32_t, std::vector<PhiMove>>> phiMoves;
+            int32_t nextOff = 0;
+            int32_t frameSize = 0;
+
+            std::vector<uint32_t> blockOffsets;
+            std::vector<Arm64JumpPatch> jumpPatches;
+
+            [[nodiscard]] int32_t Disp(const LirReg r) const {
+                return -static_cast<int32_t>(slotMap.at(r));
+            }
+
+            static std::string BaseTypeName(const std::string& name) {
+                const std::size_t pos = name.find('<');
+                return pos == std::string::npos ? name : name.substr(0, pos);
+            }
+
+            [[nodiscard]] int SizeOfRuntime(const TypeRef& t) const {
+                if (t.kind == TypeRef::Kind::Range) {
+                    const TypeRef& elemType = t.inner.empty() ? TypeRef::MakeInt64() : t.inner[0];
+                    int elemSize = SizeOf(elemType);
+                    return AlignUp(2 * elemSize + 1, elemSize > 0 ? elemSize : 1);
+                }
+                if (t.kind == TypeRef::Kind::Named) {
+                    const std::string base = BaseTypeName(t.name);
+                    if (interfaceNames.count(base)) return 16;
+                    if (base == "Slice") return 16;
+                    auto it = layouts.find(base);
+                    if (it != layouts.end()) return it->second.totalSize;
+                }
+                return SizeOf(t);
+            }
+
+            uint32_t AddSymbol(RcuSymbol s) {
+                auto idx = static_cast<uint32_t>(symbols.size());
+                symbols.push_back(std::move(s));
+                return idx;
+            }
+
+            uint32_t GetOrAddExtern(const std::string& name, uint8_t kind, const std::string& dll = {}) {
+                auto it = externSyms.find(name);
+                if (it != externSyms.end()) return it->second;
+                RcuSymbol s;
+                s.name = name;
+                s.typeName = dll;
+                s.kind = kind;
+                s.visibility = RcuSymVis::Global;
+                s.sectionIdx = RCU_SEC_EXTERNAL;
+                uint32_t idx = AddSymbol(s);
+                externSyms[name] = idx;
+                return idx;
+            }
+
+            uint32_t EnsureIntPowHelper() {
+                if (ipowSym == ~0u) {
+                    RcuSymbol s;
+                    s.name = "__rux_ipow";
+                    s.sectionIdx = RCU_TEXT_IDX;
+                    s.value = 0;
+                    s.kind = RcuSymKind::Func;
+                    s.visibility = RcuSymVis::Local;
+                    ipowSym = AddSymbol(s);
+                }
+                return ipowSym;
+            }
+
+            // rax-free integer pow: x0 = x0 ** x1 (exponentiation by squaring;
+            // negative exponent -> 0, zero exponent -> 1). Width-independent.
+            void EmitIntPowHelper() {
+                if (ipowSym == ~0u) return;
+                symbols[ipowSym].value = enc.Size();
+                static constexpr uint32_t kThunk[] = {
+                    0xF100003F, // cmp  x1, #0
+                    0x5400014B, // b.lt  NEG (+10)
+                    0xD2800022, // movz x2, #1        ; result
+                    // LOOP:
+                    0xF100003F, // cmp  x1, #0
+                    0x54000100, // b.eq  DONE (+8)
+                    0xF240003F, // tst  x1, #1
+                    0x54000040, // b.eq  SQUARE (+2)
+                    0x9B007C42, // mul  x2, x2, x0
+                    // SQUARE:
+                    0x9B007C00, // mul  x0, x0, x0
+                    0x9341FC21, // asr  x1, x1, #1
+                    0x17FFFFF9, // b    LOOP (-7)
+                    // NEG:
+                    0xD2800002, // movz x2, #0
+                    // DONE:
+                    0xAA0203E0, // mov  x0, x2
+                    0xD65F03C0, // ret
+                };
+                for (const uint32_t w : kThunk)
+                    enc.W(w);
+            }
+
+            void PredeclareFunctions() {
+                for (const auto& func : mod.funcs) {
+                    if (func.isExtern || funcSyms.contains(func.name)) continue;
+                    RcuSymbol sym;
+                    sym.name = func.name;
+                    sym.sectionIdx = RCU_TEXT_IDX;
+                    sym.value = 0;
+                    sym.kind = RcuSymKind::Func;
+                    sym.visibility = func.isPublic ? RcuSymVis::Global : RcuSymVis::Local;
+                    sym.typeName = func.returnType.ToString();
+                    funcSyms[func.name] = AddSymbol(sym);
+                }
+            }
+
+            uint32_t AlignRodata(int align) {
+                while (rodataData.size() % align)
+                    rodataData.push_back(0);
+                return static_cast<uint32_t>(rodataData.size());
+            }
+
+            uint32_t InternStr(const std::string& val) {
+                auto it = strSyms.find(val);
+                if (it != strSyms.end()) return it->second;
+                auto off = static_cast<uint32_t>(rodataData.size());
+                for (unsigned char c : val)
+                    rodataData.push_back(c);
+                rodataData.push_back(0);
+                RcuSymbol s;
+                s.name = std::format("__str{}", constIdx++);
+                s.sectionIdx = RCU_RODATA_IDX;
+                s.value = off;
+                s.size = static_cast<uint32_t>(val.size() + 1);
+                s.kind = RcuSymKind::Const;
+                s.visibility = RcuSymVis::Local;
+                uint32_t idx = AddSymbol(s);
+                strSyms[val] = idx;
+                return idx;
+            }
+
+            uint32_t InternF32(const std::string& val) {
+                auto it = f32Syms.find(val);
+                if (it != f32Syms.end()) return it->second;
+                uint32_t off = AlignRodata(4);
+                float fv = std::stof(val);
+                uint32_t bits;
+                std::memcpy(&bits, &fv, 4);
+                for (int i = 0; i < 4; ++i) {
+                    rodataData.push_back(bits & 0xFF);
+                    bits >>= 8;
+                }
+                RcuSymbol s;
+                s.name = std::format("__f32_{}", constIdx++);
+                s.sectionIdx = RCU_RODATA_IDX;
+                s.value = off;
+                s.size = 4;
+                s.kind = RcuSymKind::Const;
+                s.visibility = RcuSymVis::Local;
+                uint32_t idx = AddSymbol(s);
+                f32Syms[val] = idx;
+                return idx;
+            }
+
+            uint32_t InternF64(const std::string& val) {
+                auto it = f64Syms.find(val);
+                if (it != f64Syms.end()) return it->second;
+                uint32_t off = AlignRodata(8);
+                double dv = std::stod(val);
+                uint64_t bits;
+                std::memcpy(&bits, &dv, 8);
+                for (int i = 0; i < 8; ++i) {
+                    rodataData.push_back(bits & 0xFF);
+                    bits >>= 8;
+                }
+                RcuSymbol s;
+                s.name = std::format("__f64_{}", constIdx++);
+                s.sectionIdx = RCU_RODATA_IDX;
+                s.value = off;
+                s.size = 8;
+                s.kind = RcuSymKind::Const;
+                s.visibility = RcuSymVis::Local;
+                uint32_t idx = AddSymbol(s);
+                f64Syms[val] = idx;
+                return idx;
+            }
+
+            void AddTextReloc(uint32_t off, uint32_t sym, uint16_t type, int32_t addend = 0) {
+                textRelocs.push_back({off, sym, type, addend});
+            }
+            void AddRodataReloc(uint32_t off, uint32_t sym, uint16_t type, int32_t addend = 0) {
+                rodataRelocs.push_back({off, sym, type, addend});
+            }
+
+            // x[reg] = address of vreg's slot (or any x29-relative displacement).
+            void SlotAddr(uint8_t reg, int32_t disp) {
+                if (disp == 0) {
+                    enc.MovReg(reg, A64::kFP);
+                    return;
+                }
+                if (disp < 0) {
+                    auto mag = static_cast<uint32_t>(-disp);
+                    if (mag <= 0xFFF) {
+                        enc.SubImm(reg, A64::kFP, mag);
+                    }
+                    else if (mag <= 0xFFFFFF) {
+                        enc.SubImm(reg, A64::kFP, mag >> 12, 1);
+                        if (mag & 0xFFF) enc.SubImm(reg, reg, mag & 0xFFF);
+                    }
+                    else {
+                        enc.MovImm64(reg, mag);
+                        enc.SubReg(reg, A64::kFP, reg);
+                    }
+                }
+                else {
+                    auto mag = static_cast<uint32_t>(disp);
+                    if (mag <= 0xFFF) {
+                        enc.AddImm(reg, A64::kFP, mag);
+                    }
+                    else if (mag <= 0xFFFFFF) {
+                        enc.AddImm(reg, A64::kFP, mag >> 12, 1);
+                        if (mag & 0xFFF) enc.AddImm(reg, reg, mag & 0xFFF);
+                    }
+                    else {
+                        enc.MovImm64(reg, mag);
+                        enc.AddReg(reg, A64::kFP, reg);
+                    }
+                }
+            }
+
+            uint32_t ResolveSym(const std::string& name, uint8_t externKind = RcuSymKind::ExternFunc) {
+                if (const auto it = funcSyms.find(name); it != funcSyms.end()) return it->second;
+                if (const auto it = dataSyms.find(name); it != dataSyms.end()) return it->second;
+                return GetOrAddExtern(name, externKind);
+            }
+
+            // reg = &symbol  (ADRP + ADD :lo12:)
+            void LoadSymbolAddr(uint8_t reg, uint32_t symIdx) {
+                uint32_t adrpOff = enc.Size();
+                enc.AdrpBase(reg);
+                AddTextReloc(adrpOff, symIdx, RcuRelType::Arm64PageAdrp);
+                uint32_t addOff = enc.Size();
+                enc.AddLo12Base(reg, reg);
+                AddTextReloc(addOff, symIdx, RcuRelType::Arm64AddLo12);
+            }
+
+            // Typed loads/stores
+            void LoadIntTo(uint8_t reg, LirReg vreg, const TypeRef& t) {
+                SlotAddr(A64::kAddr, Disp(vreg));
+                int sz = SizeOf(t);
+                if (sz == 8 || sz == 0) {
+                    enc.LdrX(reg, A64::kAddr, 0);
+                }
+                else if (t.IsSigned()) {
+                    if (sz == 4) { enc.LdrW(reg, A64::kAddr, 0); enc.Sxtw(reg, reg); }
+                    else if (sz == 2) { enc.LdrhW(reg, A64::kAddr, 0); enc.Sxth(reg, reg); }
+                    else { enc.LdrbW(reg, A64::kAddr, 0); enc.Sxtb(reg, reg); }
+                }
+                else {
+                    if (sz == 4) enc.LdrW(reg, A64::kAddr, 0);
+                    else if (sz == 2) enc.LdrhW(reg, A64::kAddr, 0);
+                    else enc.LdrbW(reg, A64::kAddr, 0);
+                }
+            }
+            void LoadFloatTo(uint8_t reg, LirReg vreg, const TypeRef& t) {
+                SlotAddr(A64::kAddr, Disp(vreg));
+                if (t.kind == TypeRef::Kind::Float32) enc.LdrS(reg, A64::kAddr, 0);
+                else enc.LdrD(reg, A64::kAddr, 0);
+            }
+
+            void LoadA(LirReg vreg, const TypeRef& t) {
+                if (IsFloat(t)) { LoadFloatTo(0, vreg, t); return; }
+                if (SizeOfRuntime(t) == 16) {
+                    SlotAddr(A64::kAddr, Disp(vreg));
+                    enc.LdrX(A64::kAReg, A64::kAddr, 0);
+                    enc.LdrX(A64::kBReg, A64::kAddr, 1);
+                    return;
+                }
+                LoadIntTo(A64::kAReg, vreg, t);
+            }
+            void LoadB(LirReg vreg, const TypeRef& t) {
+                if (IsFloat(t)) { LoadFloatTo(1, vreg, t); return; }
+                LoadIntTo(A64::kBReg, vreg, t);
+            }
+            void StoreA(LirReg vreg, const TypeRef& t) {
+                SlotAddr(A64::kAddr, Disp(vreg));
+                if (IsFloat(t)) {
+                    if (t.kind == TypeRef::Kind::Float32) enc.StrS(0, A64::kAddr, 0);
+                    else enc.StrD(0, A64::kAddr, 0);
+                    return;
+                }
+                if (SizeOfRuntime(t) == 16) {
+                    enc.StrX(A64::kAReg, A64::kAddr, 0);
+                    enc.StrX(A64::kBReg, A64::kAddr, 1);
+                    return;
+                }
+                int sz = SizeOf(t);
+                int ss = sz > 0 ? sz : 8;
+                if (ss == 8) enc.StrX(A64::kAReg, A64::kAddr, 0);
+                else if (ss == 4) enc.StrW(A64::kAReg, A64::kAddr, 0);
+                else if (ss == 2) enc.StrhW(A64::kAReg, A64::kAddr, 0);
+                else enc.StrbW(A64::kAReg, A64::kAddr, 0);
+            }
+
+            // Load the typed value pointed to by base register into x9/x10/v0.
+            void LoadValueFrom(uint8_t base, const TypeRef& t) {
+                int sz = SizeOf(t);
+                if (IsFloat(t)) {
+                    if (t.kind == TypeRef::Kind::Float32) enc.LdrS(0, base, 0);
+                    else enc.LdrD(0, base, 0);
+                }
+                else if (SizeOfRuntime(t) == 16) {
+                    enc.LdrX(A64::kAReg, base, 0);
+                    enc.LdrX(A64::kBReg, base, 1);
+                }
+                else if (sz == 8 || sz == 0) {
+                    enc.LdrX(A64::kAReg, base, 0);
+                }
+                else if (t.IsSigned()) {
+                    if (sz == 4) { enc.LdrW(A64::kAReg, base, 0); enc.Sxtw(A64::kAReg, A64::kAReg); }
+                    else if (sz == 2) { enc.LdrhW(A64::kAReg, base, 0); enc.Sxth(A64::kAReg, A64::kAReg); }
+                    else { enc.LdrbW(A64::kAReg, base, 0); enc.Sxtb(A64::kAReg, A64::kAReg); }
+                }
+                else {
+                    if (sz == 4) enc.LdrW(A64::kAReg, base, 0);
+                    else if (sz == 2) enc.LdrhW(A64::kAReg, base, 0);
+                    else enc.LdrbW(A64::kAReg, base, 0);
+                }
+            }
+            void StoreValueTo(uint8_t base, const TypeRef& t) {
+                int sz = SizeOf(t);
+                if (IsFloat(t)) {
+                    if (t.kind == TypeRef::Kind::Float32) enc.StrS(0, base, 0);
+                    else enc.StrD(0, base, 0);
+                }
+                else if (SizeOfRuntime(t) == 16) {
+                    enc.StrX(A64::kAReg, base, 0);
+                    enc.StrX(A64::kBReg, base, 1);
+                }
+                else {
+                    int ss = sz > 0 ? sz : 8;
+                    if (ss == 8) enc.StrX(A64::kAReg, base, 0);
+                    else if (ss == 4) enc.StrW(A64::kAReg, base, 0);
+                    else if (ss == 2) enc.StrhW(A64::kAReg, base, 0);
+                    else enc.StrbW(A64::kAReg, base, 0);
+                }
+            }
+
+            int FieldOffset(LirReg base, const std::string& fieldName) {
+                auto typeIt = regTypes.find(base);
+                if (typeIt == regTypes.end()) return 0;
+                const TypeRef& pt = typeIt->second;
+                if (pt.kind != TypeRef::Kind::Pointer || pt.inner.empty()) return 0;
+                const TypeRef& inner = pt.inner[0];
+                if (inner.kind == TypeRef::Kind::Range) {
+                    const TypeRef& elemType = inner.inner.empty() ? TypeRef::MakeInt64() : inner.inner[0];
+                    int elemSize = SizeOf(elemType);
+                    if (fieldName == "lo") return 0;
+                    if (fieldName == "hi") return elemSize;
+                    if (fieldName == "inclusive") return 2 * elemSize;
+                    return 0;
+                }
+                if (inner.kind == TypeRef::Kind::Tuple) {
+                    std::size_t idx = 0;
+                    try {
+                        idx = std::stoul(fieldName);
+                    }
+                    catch (...) {
+                        return 0;
+                    }
+                    if (idx >= inner.inner.size()) return 0;
+                    int offset = 0;
+                    for (std::size_t i = 0; i < idx && i < inner.inner.size(); ++i) {
+                        const int sz = SizeOf(inner.inner[i]);
+                        const int al = sz > 0 ? std::min(sz, 8) : 1;
+                        if (al > 1) offset = AlignUp(offset, al);
+                        offset += sz > 0 ? sz : 8;
+                    }
+                    const int fieldSize = SizeOf(inner.inner[idx]);
+                    const int fieldAlign = fieldSize > 0 ? std::min(fieldSize, 8) : 1;
+                    if (fieldAlign > 1) offset = AlignUp(offset, fieldAlign);
+                    return offset;
+                }
+                if (inner.kind != TypeRef::Kind::Named) return 0;
+                const std::string baseName = BaseTypeName(inner.name);
+                if (interfaceNames.count(baseName)) {
+                    if (fieldName == "data") return 0;
+                    if (fieldName == "vtable") return 8;
+                    return 0;
+                }
+                if (baseName == "Slice") {
+                    if (fieldName == "data") return 0;
+                    if (fieldName == "length") return 8;
+                    return 0;
+                }
+                auto layIt = layouts.find(baseName);
+                if (layIt == layouts.end()) return 0;
+                for (const auto& field : layIt->second.fields)
+                    if (field.name == fieldName) return field.offset;
+                return 0;
+            }
+
+            int32_t AllocSlot(LirReg reg, int bytes) {
+                if (auto it = slotMap.find(reg); it != slotMap.end()) return it->second;
+                int al = (bytes > 0) ? std::min(bytes, 8) : 1;
+                nextOff = AlignUp(nextOff, al);
+                nextOff += (bytes > 0 ? bytes : 8);
+                slotMap[reg] = nextOff;
+                return nextOff;
+            }
+            int32_t AllocRegion(int bytes) {
+                int al = (bytes > 0) ? std::min(bytes, 8) : 1;
+                nextOff = AlignUp(nextOff, al);
+                nextOff += (bytes > 0 ? bytes : 8);
+                return nextOff;
+            }
+
+            void PrepassFunc(const LirFunc& func) {
+                nextOff = 0;
+                frameSize = 0;
+                slotMap.clear();
+                allocaData.clear();
+                regTypes.clear();
+                phiMoves.clear();
+                for (const auto& p : func.params) {
+                    int sz = SizeOfRuntime(p.type);
+                    AllocSlot(p.reg, sz > 0 ? sz : 8);
+                    regTypes[p.reg] = p.type;
+                }
+                for (uint32_t bi = 0; bi < func.blocks.size(); ++bi) {
+                    for (const auto& instr : func.blocks[bi].instrs) {
+                        if (instr.op == LirOpcode::Phi) {
+                            for (const auto& [src, pred] : instr.phiPreds)
+                                phiMoves[pred][bi].push_back({instr.dst, src, instr.type});
+                        }
+                        if (instr.dst == LirNoReg) continue;
+                        if (instr.op == LirOpcode::Alloca) {
+                            AllocSlot(instr.dst, 8);
+                            int dsz;
+                            if (!instr.strArg.empty()) {
+                                int count = 0;
+                                try {
+                                    count = std::stoi(instr.strArg);
+                                }
+                                catch (...) {
+                                }
+                                const TypeRef& elemType = instr.type.inner.empty() ? instr.type : instr.type.inner[0];
+                                int elemSize = SizeOfRuntime(elemType);
+                                dsz = count * (elemSize > 0 ? elemSize : 8);
+                            }
+                            else {
+                                dsz = SizeOfRuntime(instr.type);
+                            }
+                            allocaData[instr.dst] = AllocRegion(dsz > 0 ? dsz : 8);
+                            regTypes[instr.dst] = TypeRef::MakePointer(instr.type);
+                        }
+                        else {
+                            int sz = SizeOfRuntime(instr.type);
+                            AllocSlot(instr.dst, sz > 0 ? sz : 8);
+                            regTypes[instr.dst] = instr.type;
+                        }
+                    }
+                }
+                frameSize = AlignUp(nextOff, 16);
+                if (frameSize == 0) frameSize = 16;
+            }
+
+            void BuildLayouts() {
+                for (const auto& name : packageInterfaceNames)
+                    interfaceNames.insert(name);
+                for (const auto& s : structDecls) {
+                    StructLayout layout;
+                    int offset = 0, maxAlign = 1;
+                    for (const auto& f : s.fields) {
+                        int sz = SizeOfRuntime(f.type);
+                        int al = sz > 0 ? std::min(sz, 8) : 1;
+                        if (f.type.kind == TypeRef::Kind::Named) {
+                            auto it = layouts.find(BaseTypeName(f.type.name));
+                            if (it != layouts.end()) {
+                                sz = it->second.totalSize;
+                                al = it->second.alignment;
+                            }
+                        }
+                        if (al > 1) offset = AlignUp(offset, al);
+                        layout.fields.push_back({f.name, offset, sz});
+                        offset += (sz > 0 ? sz : 8);
+                        maxAlign = std::max(maxAlign, al);
+                    }
+                    layout.totalSize = AlignUp(offset, maxAlign);
+                    layout.alignment = maxAlign;
+                    layouts[s.name] = std::move(layout);
+                }
+            }
+
+            bool HasPhiMoves(uint32_t from, uint32_t to) const {
+                auto it = phiMoves.find(from);
+                if (it == phiMoves.end()) return false;
+                return it->second.contains(to);
+            }
+            void EmitPhiMoves(uint32_t from, uint32_t to) {
+                auto it1 = phiMoves.find(from);
+                if (it1 == phiMoves.end()) return;
+                auto it2 = it1->second.find(to);
+                if (it2 == it1->second.end()) return;
+                for (const auto& m : it2->second) {
+                    if (!slotMap.contains(m.src)) continue;
+                    LoadA(m.src, m.type);
+                    StoreA(m.dst, m.type);
+                }
+            }
+
+            // AAPCS64 argument marshalling. Returns extra stack bytes the caller
+            // must reclaim after the call (16-byte aligned), 0 in the common case.
+            uint32_t EmitCallArgs(const std::vector<LirReg>& args) {
+                struct StackArg {
+                    LirReg reg;
+                    TypeRef type;
+                    bool hi;
+                };
+                std::vector<StackArg> stackArgs;
+                int intIdx = 0, fltIdx = 0;
+                for (LirReg arg : args) {
+                    TypeRef at = regTypes.contains(arg) ? regTypes.at(arg) : TypeRef::MakeInt64();
+                    if (IsFloat(at)) {
+                        if (fltIdx < 8) LoadFloatTo(static_cast<uint8_t>(fltIdx++), arg, at);
+                        else stackArgs.push_back({arg, at, false});
+                    }
+                    else if (SizeOfRuntime(at) == 16) {
+                        if (intIdx <= 6) {
+                            SlotAddr(A64::kAddr, Disp(arg));
+                            enc.LdrX(static_cast<uint8_t>(intIdx), A64::kAddr, 0);
+                            enc.LdrX(static_cast<uint8_t>(intIdx + 1), A64::kAddr, 1);
+                            intIdx += 2;
+                        }
+                        else {
+                            stackArgs.push_back({arg, at, false});
+                            stackArgs.push_back({arg, at, true});
+                        }
+                    }
+                    else {
+                        if (intIdx < 8) LoadIntTo(static_cast<uint8_t>(intIdx++), arg, at);
+                        else stackArgs.push_back({arg, at, false});
+                    }
+                }
+                if (stackArgs.empty()) return 0;
+                uint32_t stackSize = AlignUp(static_cast<int>(stackArgs.size()) * 8, 16);
+                enc.SubImm(A64::kSP, A64::kSP, stackSize);
+                uint32_t slot = 0;
+                for (const auto& sa : stackArgs) {
+                    SlotAddr(A64::kAddr, Disp(sa.reg));
+                    enc.LdrX(A64::kAReg, A64::kAddr, sa.hi ? 1 : 0);
+                    enc.StrX(A64::kAReg, A64::kSP, slot++);
+                }
+                return stackSize;
+            }
+
+            void StoreReturnValue(LirReg dst, const TypeRef& t) {
+                if (IsFloat(t)) { StoreA(dst, t); return; }
+                if (SizeOfRuntime(t) == 16) {
+                    SlotAddr(A64::kAddr, Disp(dst));
+                    enc.StrX(0, A64::kAddr, 0);
+                    enc.StrX(1, A64::kAddr, 1);
+                    return;
+                }
+                enc.MovReg(A64::kAReg, 0);
+                StoreA(dst, t);
+            }
+            void LoadReturnValue(LirReg vreg, const TypeRef& t) {
+                if (IsFloat(t)) { LoadFloatTo(0, vreg, t); return; }
+                if (SizeOfRuntime(t) == 16) {
+                    SlotAddr(A64::kAddr, Disp(vreg));
+                    enc.LdrX(0, A64::kAddr, 0);
+                    enc.LdrX(1, A64::kAddr, 1);
+                    return;
+                }
+                LoadIntTo(0, vreg, t);
+            }
+
+            void GenInstr(const LirInstr& instr) {
+                using Op = LirOpcode;
+                switch (instr.op) {
+                case Op::Const: {
+                    if (instr.dst == LirNoReg) break;
+                    const TypeRef& t = instr.type;
+                    int sz = SizeOf(t);
+                    if (t.kind == TypeRef::Kind::Str) {
+                        LoadSymbolAddr(A64::kAReg, InternStr(instr.strArg));
+                        StoreA(instr.dst, t);
+                    }
+                    else if (t.kind == TypeRef::Kind::Float32) {
+                        LoadSymbolAddr(A64::kAddr, InternF32(instr.strArg));
+                        enc.LdrS(0, A64::kAddr, 0);
+                        StoreA(instr.dst, t);
+                    }
+                    else if (t.kind == TypeRef::Kind::Float64) {
+                        LoadSymbolAddr(A64::kAddr, InternF64(instr.strArg));
+                        enc.LdrD(0, A64::kAddr, 0);
+                        StoreA(instr.dst, t);
+                    }
+                    else if (t.IsBool()) {
+                        enc.Movz(A64::kAReg, (instr.strArg == "true" || instr.strArg == "1") ? 1 : 0, 0);
+                        StoreA(instr.dst, t);
+                    }
+                    else {
+                        const std::string& sv = instr.strArg.empty() ? "0" : instr.strArg;
+                        const std::uint64_t bits = ParseIntegerLiteralBits(sv).value_or(0);
+                        enc.MovImm64(A64::kAReg, bits);
+                        StoreA(instr.dst, sz > 0 ? t : TypeRef::MakeInt64());
+                    }
+                    break;
+                }
+                case Op::Alloca: {
+                    int32_t dataOff = allocaData.at(instr.dst);
+                    SlotAddr(A64::kAReg, -dataOff);
+                    StoreA(instr.dst, regTypes.at(instr.dst));
+                    break;
+                }
+                case Op::Load: {
+                    const TypeRef& t = instr.type;
+                    int sz = SizeOf(t);
+                    if (!instr.strArg.empty()) {
+                        LoadSymbolAddr(A64::kPtr, GetOrAddExtern(instr.strArg, RcuSymKind::ExternData));
+                        LoadValueFrom(A64::kPtr, t);
+                    }
+                    else {
+                        LirReg ptr = instr.srcs[0];
+                        SlotAddr(A64::kAddr, Disp(ptr));
+                        enc.LdrX(A64::kPtr, A64::kAddr, 0);
+                        LoadValueFrom(A64::kPtr, t);
+                    }
+                    StoreA(instr.dst, sz > 0 ? t : TypeRef::MakeInt64());
+                    break;
+                }
+                case Op::Store: {
+                    LirReg val = instr.srcs[0];
+                    LirReg ptr = instr.srcs[1];
+                    const TypeRef& t = instr.type;
+                    SlotAddr(A64::kAddr, Disp(ptr));
+                    enc.LdrX(A64::kPtr, A64::kAddr, 0);
+                    LoadA(val, t);
+                    StoreValueTo(A64::kPtr, t);
+                    break;
+                }
+                case Op::Add:
+                case Op::Sub:
+                case Op::And:
+                case Op::Or:
+                case Op::Xor: {
+                    const TypeRef& t = instr.type;
+                    LoadA(instr.srcs[0], t);
+                    LoadB(instr.srcs[1], t);
+                    if (IsFloat(t)) {
+                        const bool f32 = t.kind == TypeRef::Kind::Float32;
+                        if (instr.op == Op::Sub) enc.Fsub(f32, 0, 0, 1);
+                        else enc.Fadd(f32, 0, 0, 1); // bitwise-on-float: parity fallback
+                    }
+                    else {
+                        switch (instr.op) {
+                        case Op::Add: enc.AddReg(A64::kAReg, A64::kAReg, A64::kBReg); break;
+                        case Op::Sub: enc.SubReg(A64::kAReg, A64::kAReg, A64::kBReg); break;
+                        case Op::And: enc.AndReg(A64::kAReg, A64::kAReg, A64::kBReg); break;
+                        case Op::Or: enc.OrrReg(A64::kAReg, A64::kAReg, A64::kBReg); break;
+                        default: enc.EorReg(A64::kAReg, A64::kAReg, A64::kBReg); break;
+                        }
+                    }
+                    StoreA(instr.dst, t);
+                    break;
+                }
+                case Op::Mul: {
+                    const TypeRef& t = instr.type;
+                    LoadA(instr.srcs[0], t);
+                    LoadB(instr.srcs[1], t);
+                    if (IsFloat(t)) enc.Fmul(t.kind == TypeRef::Kind::Float32, 0, 0, 1);
+                    else enc.MulReg(A64::kAReg, A64::kAReg, A64::kBReg);
+                    StoreA(instr.dst, t);
+                    break;
+                }
+                case Op::Div:
+                case Op::Mod: {
+                    const TypeRef& t = instr.type;
+                    LoadA(instr.srcs[0], t);
+                    LoadB(instr.srcs[1], t);
+                    if (IsFloat(t)) {
+                        enc.Fdiv(t.kind == TypeRef::Kind::Float32, 0, 0, 1);
+                    }
+                    else if (instr.op == Op::Div) {
+                        if (t.IsSigned()) enc.SdivReg(A64::kAReg, A64::kAReg, A64::kBReg);
+                        else enc.UdivReg(A64::kAReg, A64::kAReg, A64::kBReg);
+                    }
+                    else {
+                        if (t.IsSigned()) enc.SdivReg(11, A64::kAReg, A64::kBReg);
+                        else enc.UdivReg(11, A64::kAReg, A64::kBReg);
+                        enc.Msub(A64::kAReg, 11, A64::kBReg, A64::kAReg);
+                    }
+                    StoreA(instr.dst, t);
+                    break;
+                }
+                case Op::Pow: {
+                    const TypeRef& t = instr.type;
+                    if (IsFloat(t)) {
+                        uint32_t sym = GetOrAddExtern("pow", RcuSymKind::ExternFunc);
+                        LoadFloatTo(0, instr.srcs[0], t);
+                        LoadFloatTo(1, instr.srcs[1], t);
+                        uint32_t ro = enc.EmitBl();
+                        AddTextReloc(ro, sym, RcuRelType::Arm64Branch26);
+                        StoreA(instr.dst, t);
+                    }
+                    else {
+                        uint32_t sym = EnsureIntPowHelper();
+                        LoadIntTo(0, instr.srcs[0], t);
+                        LoadIntTo(1, instr.srcs[1], t);
+                        uint32_t ro = enc.EmitBl();
+                        AddTextReloc(ro, sym, RcuRelType::Arm64Branch26);
+                        enc.MovReg(A64::kAReg, 0);
+                        StoreA(instr.dst, t);
+                    }
+                    break;
+                }
+                case Op::Shl:
+                case Op::Shr: {
+                    const TypeRef& t = instr.type;
+                    LoadA(instr.srcs[0], t);
+                    LoadIntTo(A64::kBReg, instr.srcs[1], regTypes.contains(instr.srcs[1]) ? regTypes.at(instr.srcs[1]) : t);
+                    if (instr.op == Op::Shr) {
+                        if (t.IsSigned()) enc.AsrvReg(A64::kAReg, A64::kAReg, A64::kBReg);
+                        else enc.LsrvReg(A64::kAReg, A64::kAReg, A64::kBReg);
+                    }
+                    else {
+                        enc.LslvReg(A64::kAReg, A64::kAReg, A64::kBReg);
+                    }
+                    StoreA(instr.dst, t);
+                    break;
+                }
+                case Op::Neg: {
+                    const TypeRef& t = instr.type;
+                    LoadA(instr.srcs[0], t);
+                    if (IsFloat(t)) enc.Fneg(t.kind == TypeRef::Kind::Float32, 0, 0);
+                    else enc.NegReg(A64::kAReg, A64::kAReg);
+                    StoreA(instr.dst, t);
+                    break;
+                }
+                case Op::Not: {
+                    LoadA(instr.srcs[0], instr.type);
+                    enc.CmpImm(A64::kAReg, 0);
+                    enc.Cset(A64::kAReg, A64::EQ);
+                    StoreA(instr.dst, TypeRef::MakeBool());
+                    break;
+                }
+                case Op::BitNot: {
+                    LoadA(instr.srcs[0], instr.type);
+                    enc.MvnReg(A64::kAReg, A64::kAReg);
+                    StoreA(instr.dst, instr.type);
+                    break;
+                }
+                case Op::CmpEq:
+                case Op::CmpNe:
+                case Op::CmpLt:
+                case Op::CmpLe:
+                case Op::CmpGt:
+                case Op::CmpGe: {
+                    const TypeRef& lhsT = regTypes.contains(instr.srcs[0]) ? regTypes.at(instr.srcs[0]) : instr.type;
+                    LoadA(instr.srcs[0], lhsT);
+                    LoadB(instr.srcs[1], lhsT);
+                    uint8_t cond;
+                    if (IsFloat(lhsT)) {
+                        enc.Fcmp(lhsT.kind == TypeRef::Kind::Float32, 0, 1);
+                        switch (instr.op) {
+                        case Op::CmpEq: cond = A64::EQ; break;
+                        case Op::CmpNe: cond = A64::NE; break;
+                        case Op::CmpLt: cond = A64::MI; break;
+                        case Op::CmpLe: cond = A64::LS; break;
+                        case Op::CmpGt: cond = A64::GT; break;
+                        default: cond = A64::GE; break;
+                        }
+                    }
+                    else {
+                        enc.CmpReg(A64::kAReg, A64::kBReg);
+                        bool sig = lhsT.IsSigned();
+                        switch (instr.op) {
+                        case Op::CmpEq: cond = A64::EQ; break;
+                        case Op::CmpNe: cond = A64::NE; break;
+                        case Op::CmpLt: cond = sig ? A64::LT : A64::CC; break;
+                        case Op::CmpLe: cond = sig ? A64::LE : A64::LS; break;
+                        case Op::CmpGt: cond = sig ? A64::GT : A64::HI; break;
+                        default: cond = sig ? A64::GE : A64::CS; break;
+                        }
+                    }
+                    enc.Cset(A64::kAReg, cond);
+                    StoreA(instr.dst, TypeRef::MakeBool());
+                    break;
+                }
+                case Op::Cast: {
+                    const TypeRef& dstT = instr.type;
+                    TypeRef srcT = regTypes.contains(instr.srcs[0]) ? regTypes.at(instr.srcs[0]) : dstT;
+                    LoadA(instr.srcs[0], srcT);
+                    bool srcFl = IsFloat(srcT), dstFl = IsFloat(dstT);
+                    if (srcFl && !dstFl) {
+                        enc.Fcvtzs(srcT.kind == TypeRef::Kind::Float32, A64::kAReg, 0);
+                    }
+                    else if (!srcFl && dstFl) {
+                        enc.Scvtf(dstT.kind == TypeRef::Kind::Float32, 0, A64::kAReg);
+                    }
+                    else if (srcFl && dstFl) {
+                        if (srcT.kind == TypeRef::Kind::Float32 && dstT.kind == TypeRef::Kind::Float64)
+                            enc.FcvtS2D(0, 0);
+                        else if (srcT.kind == TypeRef::Kind::Float64 && dstT.kind == TypeRef::Kind::Float32)
+                            enc.FcvtD2S(0, 0);
+                    }
+                    StoreA(instr.dst, dstT);
+                    break;
+                }
+                case Op::Call: {
+                    uint32_t stackSize = EmitCallArgs(instr.srcs);
+                    uint32_t sym = ResolveSym(instr.strArg, RcuSymKind::ExternFunc);
+                    uint32_t ro = enc.EmitBl();
+                    AddTextReloc(ro, sym, RcuRelType::Arm64Branch26);
+                    if (stackSize) enc.AddImm(A64::kSP, A64::kSP, stackSize);
+                    if (instr.dst != LirNoReg && !instr.type.IsOpaque())
+                        StoreReturnValue(instr.dst, instr.type);
+                    break;
+                }
+                case Op::CallIndirect: {
+                    if (instr.srcs.empty()) break;
+                    LirReg callee = instr.srcs[0];
+                    std::vector<LirReg> args(instr.srcs.begin() + 1, instr.srcs.end());
+                    uint32_t stackSize = EmitCallArgs(args);
+                    LoadIntTo(A64::kAddr, callee, regTypes.contains(callee) ? regTypes.at(callee) : TypeRef::MakeInt64());
+                    enc.Blr(A64::kAddr);
+                    if (stackSize) enc.AddImm(A64::kSP, A64::kSP, stackSize);
+                    if (instr.dst != LirNoReg && !instr.type.IsOpaque())
+                        StoreReturnValue(instr.dst, instr.type);
+                    break;
+                }
+                case Op::GlobalAddr: {
+                    uint32_t sym = ResolveSym(instr.strArg, RcuSymKind::ExternData);
+                    LoadSymbolAddr(A64::kAReg, sym);
+                    StoreA(instr.dst, regTypes.contains(instr.dst) ? regTypes.at(instr.dst) : TypeRef::MakeInt64());
+                    break;
+                }
+                case Op::FieldPtr: {
+                    LirReg base = instr.srcs[0];
+                    SlotAddr(A64::kAddr, Disp(base));
+                    enc.LdrX(A64::kAReg, A64::kAddr, 0);
+                    int off = FieldOffset(base, instr.strArg);
+                    if (off > 0) {
+                        if (off <= 0xFFF) enc.AddImm(A64::kAReg, A64::kAReg, static_cast<uint32_t>(off));
+                        else { enc.MovImm64(A64::kBReg, static_cast<uint64_t>(off)); enc.AddReg(A64::kAReg, A64::kAReg, A64::kBReg); }
+                    }
+                    StoreA(instr.dst, regTypes.contains(instr.dst) ? regTypes.at(instr.dst) : TypeRef::MakeInt64());
+                    break;
+                }
+                case Op::IndexPtr: {
+                    LirReg base = instr.srcs[0];
+                    LirReg idx = instr.srcs[1];
+                    int elemSz = (instr.type.kind == TypeRef::Kind::Pointer && !instr.type.inner.empty())
+                        ? SizeOfRuntime(instr.type.inner[0])
+                        : 8;
+                    if (elemSz < 1) elemSz = 1;
+                    SlotAddr(A64::kAddr, Disp(base));
+                    enc.LdrX(A64::kAReg, A64::kAddr, 0);
+                    LoadIntTo(A64::kBReg, idx, regTypes.contains(idx) ? regTypes.at(idx) : TypeRef::MakeInt64());
+                    enc.MovImm64(11, static_cast<uint64_t>(elemSz));
+                    enc.MulReg(A64::kBReg, A64::kBReg, 11);
+                    enc.AddReg(A64::kAReg, A64::kAReg, A64::kBReg);
+                    StoreA(instr.dst, regTypes.contains(instr.dst) ? regTypes.at(instr.dst) : TypeRef::MakeInt64());
+                    break;
+                }
+                case Op::Phi:
+                default:
+                    break;
+                }
+            }
+
+            void GenTerm(uint32_t blockIdx, const LirTerminator& term) {
+                switch (term.kind) {
+                case LirTermKind::Jump: {
+                    EmitPhiMoves(blockIdx, term.trueTarget);
+                    uint32_t po = enc.EmitB();
+                    jumpPatches.push_back({po, term.trueTarget, false, 0});
+                    break;
+                }
+                case LirTermKind::Branch: {
+                    const TypeRef condT = regTypes.contains(term.cond) ? regTypes.at(term.cond) : TypeRef::MakeBool();
+                    LoadIntTo(A64::kAReg, term.cond, condT);
+                    enc.CmpImm(A64::kAReg, 0);
+                    // b.eq -> false trampoline (emitted right after the true path)
+                    uint32_t beqOff = enc.EmitBcond(A64::EQ);
+                    EmitPhiMoves(blockIdx, term.trueTarget);
+                    uint32_t jmpTrue = enc.EmitB();
+                    jumpPatches.push_back({jmpTrue, term.trueTarget, false, 0});
+                    enc.PatchBcond(beqOff, A64::EQ, static_cast<int32_t>(enc.Size()) - static_cast<int32_t>(beqOff));
+                    EmitPhiMoves(blockIdx, term.falseTarget);
+                    uint32_t jmpFalse = enc.EmitB();
+                    jumpPatches.push_back({jmpFalse, term.falseTarget, false, 0});
+                    break;
+                }
+                case LirTermKind::Return: {
+                    if (term.retVal && *term.retVal != LirNoReg)
+                        LoadReturnValue(*term.retVal, term.retType);
+                    enc.MovSpFp();
+                    enc.LdpFpLrPost();
+                    enc.Ret();
+                    break;
+                }
+                case LirTermKind::Switch: {
+                    LoadIntTo(A64::kAReg, term.cond, regTypes.contains(term.cond) ? regTypes.at(term.cond) : TypeRef::MakeInt64());
+                    for (const auto& c : term.cases) {
+                        const std::uint64_t bits = ParseIntegerLiteralBits(c.value).value_or(0);
+                        enc.MovImm64(A64::kBReg, bits);
+                        enc.CmpReg(A64::kAReg, A64::kBReg);
+                        uint32_t po = enc.EmitBcond(A64::EQ);
+                        jumpPatches.push_back({po, c.target, true, A64::EQ});
+                    }
+                    EmitPhiMoves(blockIdx, term.defaultTarget);
+                    uint32_t po = enc.EmitB();
+                    jumpPatches.push_back({po, term.defaultTarget, false, 0});
+                    break;
+                }
+                }
+            }
+
+            void PatchJumps() {
+                for (const auto& p : jumpPatches) {
+                    int32_t disp = static_cast<int32_t>(blockOffsets[p.targetBlock]) - static_cast<int32_t>(p.patchOff);
+                    if (p.conditional) enc.PatchBcond(p.patchOff, p.cond, disp);
+                    else enc.PatchB(p.patchOff, disp);
+                }
+                jumpPatches.clear();
+            }
+
+            void GenFunc(const LirFunc& func) {
+                if (func.isExtern) {
+                    GetOrAddExtern(func.name, RcuSymKind::ExternFunc, func.dll);
+                    return;
+                }
+                PrepassFunc(func);
+                jumpPatches.clear();
+                uint32_t funcStart = enc.Size();
+                RcuSymbol sym;
+                sym.name = func.name;
+                sym.sectionIdx = RCU_TEXT_IDX;
+                sym.value = funcStart;
+                sym.kind = RcuSymKind::Func;
+                sym.visibility = func.isPublic ? RcuSymVis::Global : RcuSymVis::Local;
+                sym.typeName = func.returnType.ToString();
+                if (const auto it = funcSyms.find(func.name); it != funcSyms.end())
+                    symbols[it->second] = std::move(sym);
+                else
+                    funcSyms[func.name] = AddSymbol(std::move(sym));
+
+                // Prologue: save fp/lr, set frame pointer, reserve the frame.
+                enc.StpFpLrPre();
+                enc.MovFpSp();
+                {
+                    uint32_t fs = static_cast<uint32_t>(frameSize);
+                    if (fs <= 0xFFF) {
+                        enc.SubImm(A64::kSP, A64::kSP, fs);
+                    }
+                    else if (fs <= 0xFFFFFF) {
+                        enc.SubImm(A64::kSP, A64::kSP, fs >> 12, 1);
+                        if (fs & 0xFFF) enc.SubImm(A64::kSP, A64::kSP, fs & 0xFFF);
+                    }
+                    else {
+                        enc.MovImm64(A64::kAddr, fs);
+                        enc.SubReg(A64::kSP, A64::kSP, A64::kAddr);
+                    }
+                }
+
+                // Spill incoming arguments to their slots (AAPCS64).
+                int intIdx = 0, fltIdx = 0, stackArgIdx = 0;
+                for (const auto& p : func.params) {
+                    int32_t d = Disp(p.reg);
+                    if (IsFloat(p.type)) {
+                        if (fltIdx < 8) {
+                            SlotAddr(A64::kAddr, d);
+                            if (p.type.kind == TypeRef::Kind::Float32) enc.StrS(static_cast<uint8_t>(fltIdx), A64::kAddr, 0);
+                            else enc.StrD(static_cast<uint8_t>(fltIdx), A64::kAddr, 0);
+                            ++fltIdx;
+                        }
+                        else {
+                            enc.LdrX(A64::kAReg, A64::kFP, static_cast<uint32_t>((16 + stackArgIdx * 8) / 8));
+                            StoreA(p.reg, p.type);
+                            ++stackArgIdx;
+                        }
+                    }
+                    else if (SizeOfRuntime(p.type) == 16 && intIdx <= 6) {
+                        SlotAddr(A64::kAddr, d);
+                        enc.StrX(static_cast<uint8_t>(intIdx), A64::kAddr, 0);
+                        enc.StrX(static_cast<uint8_t>(intIdx + 1), A64::kAddr, 1);
+                        intIdx += 2;
+                    }
+                    else if (intIdx < 8) {
+                        SlotAddr(A64::kAddr, d);
+                        int ss = SizeOf(p.type);
+                        ss = ss > 0 ? ss : 8;
+                        auto r = static_cast<uint8_t>(intIdx);
+                        if (ss == 8 || SizeOfRuntime(p.type) > 8) enc.StrX(r, A64::kAddr, 0);
+                        else if (ss == 4) enc.StrW(r, A64::kAddr, 0);
+                        else if (ss == 2) enc.StrhW(r, A64::kAddr, 0);
+                        else enc.StrbW(r, A64::kAddr, 0);
+                        ++intIdx;
+                    }
+                    else {
+                        enc.LdrX(A64::kAReg, A64::kFP, static_cast<uint32_t>((16 + stackArgIdx * 8) / 8));
+                        StoreA(p.reg, p.type);
+                        ++stackArgIdx;
+                    }
+                }
+
+                blockOffsets.assign(func.blocks.size(), 0);
+                for (uint32_t bi = 0; bi < func.blocks.size(); ++bi) {
+                    blockOffsets[bi] = enc.Size();
+                    const auto& block = func.blocks[bi];
+                    for (const auto& instr : block.instrs)
+                        GenInstr(instr);
+                    if (block.term) GenTerm(bi, *block.term);
+                }
+                PatchJumps();
+                for (auto& s : symbols) {
+                    if (s.name == func.name && s.sectionIdx == RCU_TEXT_IDX && s.value == funcStart) {
+                        s.size = enc.Size() - funcStart;
+                        break;
+                    }
+                }
+            }
+
+            void EmitVtables() {
+                for (const auto& vt : mod.vtables) {
+                    AlignRodata(8);
+                    RcuSymbol sym;
+                    sym.name = vt.label;
+                    sym.sectionIdx = RCU_RODATA_IDX;
+                    sym.value = static_cast<uint32_t>(rodataData.size());
+                    sym.size = static_cast<uint32_t>(vt.methods.size() * 8);
+                    sym.kind = RcuSymKind::Const;
+                    sym.visibility = RcuSymVis::Global;
+                    const uint32_t vtSym = AddSymbol(std::move(sym));
+                    dataSyms[vt.label] = vtSym;
+                    for (const auto& method : vt.methods) {
+                        const uint32_t slotOff = static_cast<uint32_t>(rodataData.size());
+                        for (int i = 0; i < 8; ++i)
+                            rodataData.push_back(0);
+                        uint32_t methodSym;
+                        if (const auto it = funcSyms.find(method); it != funcSyms.end())
+                            methodSym = it->second;
+                        else
+                            methodSym = GetOrAddExtern(method, RcuSymKind::ExternFunc);
+                        AddRodataReloc(slotOff, methodSym, RcuRelType::Abs64);
+                    }
+                }
+            }
+
+            void GenModule() {
+                BuildLayouts();
+                PredeclareFunctions();
+                for (const auto& ev : mod.externVars)
+                    GetOrAddExtern(ev.name, RcuSymKind::ExternData);
+                for (const auto& c : mod.consts) {
+                    RcuSymbol s;
+                    s.name = c.name;
+                    s.sectionIdx = RCU_DATA_IDX;
+                    s.value = static_cast<uint32_t>(dataData.size());
+                    s.kind = RcuSymKind::Const;
+                    s.visibility = c.isPublic ? RcuSymVis::Global : RcuSymVis::Local;
+                    s.typeName = c.type.ToString();
+                    for (int i = 0; i < 8; ++i)
+                        dataData.push_back(0);
+                    s.size = 8;
+                    AddSymbol(s);
+                }
+                EmitVtables();
+                for (const auto& func : mod.funcs)
+                    GenFunc(func);
+                EmitIntPowHelper();
+            }
+        };
+
+        RcuFile Arm64CodeGen::Generate() {
+            GenModule();
+            RcuFile file;
+            file.arch = RcuArch::Arm64;
+            file.sourcePath = mod.name;
+            file.packageName = pkgName;
+            file.buildTimestamp = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch())
+                    .count());
+            {
+                std::string ver = RUX_VERSION;
+                unsigned M = 0, mi = 0, p = 0;
+                auto parseNum = [](const char* s, unsigned& out) -> const char* {
+                    while (*s && (*s < '0' || *s > '9'))
+                        ++s;
+                    while (*s >= '0' && *s <= '9') {
+                        out = out * 10 + static_cast<unsigned>(*s - '0');
+                        ++s;
+                    }
+                    return s;
+                };
+                const char* c1 = parseNum(ver.c_str(), M);
+                const char* c2 = parseNum(c1, mi);
+                parseNum(c2, p);
+                file.ruxVersion = (M << 16) | (mi << 8) | p;
+            }
+            {
+                RcuSection text;
+                text.name = ".text";
+                text.type = RcuSecType::Text;
+                text.flags = RcuSecFlag::Alloc | RcuSecFlag::Exec | RcuSecFlag::Read;
+                text.alignment = 16;
+                text.data = std::move(textData);
+                text.relocs = std::move(textRelocs);
+                file.sections.push_back(std::move(text));
+            }
+            {
+                RcuSection rodata;
+                rodata.name = ".rodata";
+                rodata.type = RcuSecType::RoData;
+                rodata.flags = RcuSecFlag::Alloc | RcuSecFlag::Read;
+                rodata.alignment = 8;
+                rodata.data = std::move(rodataData);
+                rodata.relocs = std::move(rodataRelocs);
+                file.sections.push_back(std::move(rodata));
+            }
+            {
+                RcuSection data;
+                data.name = ".data";
+                data.type = RcuSecType::Data;
+                data.flags = RcuSecFlag::Alloc | RcuSecFlag::Read | RcuSecFlag::Write;
+                data.alignment = 8;
+                data.data = std::move(dataData);
+                file.sections.push_back(std::move(data));
+            }
+            file.symbols = std::move(symbols);
+            file.flags = 0x01;
+            file.hasMetadata = true;
+            return file;
+        }
+
         // CRC-32C (Castagnoli)
         uint32_t Crc32cTable[256];
         bool Crc32cReady = false;
@@ -3057,7 +4461,7 @@ namespace Rux {
             static std::string Dump(const RcuFile& f) {
                 std::ostringstream out;
                 out << "; RCU  Rux Compiled Unit  v1.0\n";
-                out << "; Architecture: x86-64 (Windows x64)\n";
+                out << std::format("; Architecture: {}\n", f.arch == RcuArch::Arm64 ? "arm64 (AArch64)" : "x86-64");
                 out << std::format("; Source:        {}\n", f.sourcePath.empty() ? "<unknown>" : f.sourcePath);
                 out << std::format("; Package:       {}\n", f.packageName.empty() ? "<unknown>" : f.packageName);
                 if (f.ruxVersion) {
@@ -3227,7 +4631,11 @@ namespace Rux {
                 interfaceNames.push_back(name);
         }
         for (const auto& mod : lir.modules) {
+#if defined(__aarch64__) || defined(_M_ARM64)
+            Arm64CodeGen gen(mod, structDecls, interfaceNames, packageName);
+#else
             RcuCodeGen gen(mod, structDecls, interfaceNames, packageName);
+#endif
             result.push_back(gen.Generate());
         }
         return result;
