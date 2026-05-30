@@ -118,10 +118,18 @@ cmake --install build --prefix /usr/local
 
 ### macOS notes
 
-On macOS, `rux` produces statically linked, ad-hoc code-signed Mach-O
-executables. Generated programs are currently **x86-64 only** — on Apple
-Silicon they run through Rosetta 2 (the `rux` compiler itself builds and runs
-natively on arm64). A Homebrew formula for distributing `rux` lives under
+On macOS, `rux` produces ad-hoc code-signed Mach-O executables that match the
+host architecture: a compiler built on **Apple Silicon emits native arm64
+binaries**, and one built on an Intel Mac emits x86-64. The architecture is
+selected automatically — no flags required.
+
+On Apple Silicon the output is a minimal *dynamic* Mach-O (Apple Silicon's
+kernel refuses pure-static executables): it links `/usr/lib/dyld` and
+`libSystem` so the loader accepts it, but the program still drives the OS
+entirely through the linker's built-in syscall thunks — `libSystem` is loaded,
+never called. x86-64 output remains a fully static Mach-O. Both paths go
+through Rux's own assembler and linker; no external toolchain is invoked beyond
+`codesign`. A Homebrew formula for distributing `rux` lives under
 [`packaging/homebrew/`](packaging/homebrew/).
 
 ## Contributing

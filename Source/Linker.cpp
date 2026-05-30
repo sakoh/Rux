@@ -1576,6 +1576,95 @@ namespace Rux {
         return it->second;
     }
 
+    // AArch64 (Apple Silicon) compat thunks. Rux extern calls arrive in the
+    // AAPCS64 layout (x0-x7); each thunk forwards them into the arm64 macOS
+    // syscall convention: number in x16 (BSD class mask 0x2000000), arguments
+    // already in x0-x5, `svc #0x80`, result in x0, carry flag set on error.
+    static std::optional<Buf> MacCompatThunkArm64(const std::string& name) {
+        const auto words = [](std::initializer_list<uint32_t> ws) {
+            Buf b;
+            b.reserve(ws.size() * 4);
+            for (uint32_t w : ws) {
+                b.push_back(w & 0xFF);
+                b.push_back((w >> 8) & 0xFF);
+                b.push_back((w >> 16) & 0xFF);
+                b.push_back((w >> 24) & 0xFF);
+            }
+            return b;
+        };
+        static const std::unordered_map<std::string, Buf> thunks = {
+            // ExitProcess(code) -> exit(code).  SYS_exit = 0x2000001.
+            {"ExitProcess", words({0xD2800030, 0xF2A04010, 0xD4001001})},
+            // GetStdHandle(handle) -> fd.  -10/-11 map to stdin(0)/stdout(1), else stderr(2).
+            {"GetStdHandle",
+             words({
+                 0x3100281F, // cmn  w0, #10   (handle == -10 ?)
+                 0x540000A0, // b.eq IN
+                 0x31002C1F, // cmn  w0, #11   (handle == -11 ?)
+                 0x540000A0, // b.eq OUT
+                 0x52800040, // movz w0, #2    (stderr)
+                 0xD65F03C0, // ret
+                 0x52800000, // IN:  movz w0, #0 (stdin)
+                 0xD65F03C0, // ret
+                 0x52800020, // OUT: movz w0, #1 (stdout)
+                 0xD65F03C0, // ret
+             })},
+            {"GetProcessHeap", words({0x52800020, 0xD65F03C0})}, // -> 1
+            {"HeapFree", words({0x52800020, 0xD65F03C0})}, // -> TRUE
+            // HeapAlloc(heap, flags, size) -> mmap(NULL, size, RW, PRIVATE|ANON, -1, 0).
+            // BSD MAP_PRIVATE|MAP_ANON = 0x1002; macOS SYS_mmap = 0x20000C5.
+            {"HeapAlloc",
+             words({
+                 0xAA0203E1, // mov  x1, x2    (len = size)
+                 0xD2800000, // movz x0, #0    (addr = NULL)
+                 0xD2800062, // movz x2, #3    (PROT_READ|PROT_WRITE)
+                 0xD2820043, // movz x3, #0x1002 (MAP_PRIVATE|MAP_ANON)
+                 0x92800004, // movn x4, #0    (fd = -1)
+                 0xD2800005, // movz x5, #0    (offset = 0)
+                 0xD28018B0, // movz x16, #0xC5
+                 0xF2A04010, // movk x16, #0x200, lsl #16  (SYS_mmap)
+                 0xD4001001, // svc  #0x80
+                 0xD65F03C0, // ret
+             })},
+            // ReadFile(handle, buf, count, *bytesRead, overlapped) -> read(fd, buf, count).
+            {"ReadFile",
+             words({
+                 0xD2800070, // movz x16, #3
+                 0xF2A04010, // movk x16, #0x200, lsl #16  (SYS_read)
+                 0xD4001001, // svc  #0x80
+                 0x54000082, // b.cs ERR  (carry set => error)
+                 0xF9000060, // str  x0, [x3]  (*bytesRead = result)
+                 0x52800020, // movz w0, #1    (TRUE)
+                 0xD65F03C0, // ret
+                 0x52800000, // ERR: movz w0, #0 (FALSE)
+                 0xD65F03C0, // ret
+             })},
+            // WriteFile(handle, buf, count, *bytesWritten, overlapped) -> write(fd, buf, count).
+            {"WriteFile",
+             words({
+                 0xD2800090, // movz x16, #4
+                 0xF2A04010, // movk x16, #0x200, lsl #16  (SYS_write)
+                 0xD4001001, // svc  #0x80
+                 0x54000082, // b.cs ERR
+                 0xF9000060, // str  x0, [x3]  (*bytesWritten = result)
+                 0x52800020, // movz w0, #1    (TRUE)
+                 0xD65F03C0, // ret
+                 0x52800000, // ERR: movz w0, #0 (FALSE)
+                 0xD65F03C0, // ret
+             })},
+            // RtlCopyMemory(dst, src, len): byte copy.
+            {"RtlCopyMemory",
+             words({0xB40000E2, 0x39400023, 0x39000003, 0x91000400, 0x91000421, 0xD1000442, 0x17FFFFFA, 0xD65F03C0})},
+            // RtlFillMemory(dst, len, fill): byte fill.
+            {"RtlFillMemory", words({0xB40000A1, 0x39000002, 0x91000400, 0xD1000421, 0x17FFFFFC, 0xD65F03C0})},
+            // RtlZeroMemory(dst, len): byte zero.
+            {"RtlZeroMemory", words({0xB40000A1, 0x3900001F, 0x91000400, 0xD1000421, 0x17FFFFFC, 0xD65F03C0})},
+        };
+        const auto it = thunks.find(name);
+        if (it == thunks.end()) return std::nullopt;
+        return it->second;
+    }
+
     // Links RcuFile objects into a static x86-64 Mach-O executable. No dyld: the
     // kernel jumps straight to our entry via LC_UNIXTHREAD, and all OS interaction
     // goes through raw syscalls in the compat thunks (same model as LinkElf64).
@@ -1583,9 +1672,19 @@ namespace Rux {
     // unsigned binary (including x86-64 ones translated by Rosetta 2).
     bool Linker::LinkMachO64(const std::filesystem::path& outputPath) {
         static constexpr uint64_t kBase = 0x100000000ULL; // __TEXT base (after 4 GiB __PAGEZERO)
-        static constexpr uint64_t kPage = 0x1000;
 
         const auto alignUp64 = [](const uint64_t v, const uint64_t a) { return (v + a - 1) & ~(a - 1); };
+
+        // Native arm64 (Apple Silicon) objects select the AArch64 code path:
+        // arm64 thunks, instruction-field relocations, and an arm64 Mach-O.
+        const bool isArm = !objects.empty() && objects.front().arch == RcuArch::Arm64;
+        // Apple Silicon maps memory in 16 KiB pages; every segment's vmaddr/vmsize
+        // and file offset must honor that granularity or the kernel rejects the
+        // image. x86-64 uses the classic 4 KiB page.
+        const uint64_t kPage = isArm ? 0x4000 : 0x1000;
+        const auto thunkFor = [isArm](const std::string& n) {
+            return isArm ? MacCompatThunkArm64(n) : MacCompatThunk(n);
+        };
 
         // 1. Resolve externs: each must be satisfiable by a compat thunk.
         std::unordered_set<std::string> definedSymbols;
@@ -1602,7 +1701,7 @@ namespace Rux {
                     const auto& sym = obj.symbols[reloc.symbolIndex];
                     if ((sym.kind == RcuSymKind::ExternFunc || sym.kind == RcuSymKind::ExternData) &&
                         !definedSymbols.contains(sym.name)) {
-                        if (MacCompatThunk(sym.name))
+                        if (thunkFor(sym.name))
                             macCompatExterns.insert(sym.name);
                         else
                             Error("external symbol '" + sym.name + "' is not supported by the macOS Mach-O linker yet");
@@ -1612,20 +1711,34 @@ namespace Rux {
         }
         if (!errors.empty()) return false;
 
-        // 2. Entry preamble: call Main; exit(eax).
+        // 2. Entry preamble: call Main; exit(return value).
         Buf textPre;
-        const size_t kCallMainDisp = textPre.size() + 1;
-        textPre.insert(textPre.end(), {0xE8, 0x00, 0x00, 0x00, 0x00}); // call Main
-        textPre.insert(textPre.end(), {0x89, 0xC7}); // mov edi, eax (exit code)
-        textPre.insert(textPre.end(), {0xB8, 0x01, 0x00, 0x00, 0x02}); // mov eax, 0x2000001 (SYS_exit)
-        textPre.insert(textPre.end(), {0x0F, 0x05}); // syscall
+        size_t kCallMainDisp;
+        if (isArm) {
+            kCallMainDisp = textPre.size(); // bl Main is the first instruction word
+            // bl Main (patched); movz x16,#1; movk x16,#0x200,lsl#16 (SYS_exit); svc #0x80.
+            // Main's return value is already in x0 — the exit code argument.
+            for (uint32_t w : {0x94000000u, 0xD2800030u, 0xF2A04010u, 0xD4001001u}) {
+                textPre.push_back(w & 0xFF);
+                textPre.push_back((w >> 8) & 0xFF);
+                textPre.push_back((w >> 16) & 0xFF);
+                textPre.push_back((w >> 24) & 0xFF);
+            }
+        }
+        else {
+            kCallMainDisp = textPre.size() + 1;
+            textPre.insert(textPre.end(), {0xE8, 0x00, 0x00, 0x00, 0x00}); // call Main
+            textPre.insert(textPre.end(), {0x89, 0xC7}); // mov edi, eax (exit code)
+            textPre.insert(textPre.end(), {0xB8, 0x01, 0x00, 0x00, 0x02}); // mov eax, 0x2000001 (SYS_exit)
+            textPre.insert(textPre.end(), {0x0F, 0x05}); // syscall
+        }
 
         // 3. Append compat thunks after the preamble (sorted for determinism).
         std::unordered_map<std::string, uint32_t> macCompatThunkOff;
         std::vector<std::string> macCompatNames(macCompatExterns.begin(), macCompatExterns.end());
         std::sort(macCompatNames.begin(), macCompatNames.end());
         for (const auto& name : macCompatNames) {
-            auto thunk = MacCompatThunk(name);
+            auto thunk = thunkFor(name);
             if (!thunk) continue;
             macCompatThunkOff[name] = static_cast<uint32_t>(textPre.size());
             textPre.insert(textPre.end(), thunk->begin(), thunk->end());
@@ -1657,17 +1770,34 @@ namespace Rux {
         textBuf.insert(textBuf.end(), textPre.begin(), textPre.end());
         textBuf.insert(textBuf.end(), mergedText.begin(), mergedText.end());
 
-        // 5. Fixed load-command set keeps header size constant:
-        //    __PAGEZERO, __TEXT(__text,__const), __DATA(__data), __LINKEDIT, LC_UNIXTHREAD.
+        // 5. Load-command set. The four segments (__PAGEZERO, __TEXT[__text,__const],
+        //    __DATA[__data], __LINKEDIT) are common to both architectures. They are
+        //    then followed by either:
+        //      x86-64 (static):  LC_UNIXTHREAD — the kernel jumps straight to entry.
+        //      arm64  (dynamic): the loader command set Apple Silicon requires, since
+        //                        the native kernel refuses pure-static executables —
+        //                        LC_DYLD_CHAINED_FIXUPS, LC_SYMTAB, LC_DYSYMTAB,
+        //                        LC_LOAD_DYLINKER, LC_UUID, LC_BUILD_VERSION, LC_MAIN,
+        //                        LC_LOAD_DYLIB(libSystem). The program still drives the
+        //                        OS purely through the syscall thunks; libSystem is
+        //                        loaded only to satisfy dyld, not called.
         constexpr uint32_t kSegCmd = 72; // segment_command_64 (no trailing sections)
         constexpr uint32_t kSect = 80; // section_64
-        constexpr uint32_t kThreadCmd = 184; // LC_UNIXTHREAD with x86_THREAD_STATE64 (count 42)
-        constexpr uint32_t kNCmds = 5;
-        const uint32_t sizeOfCmds = kSegCmd + // __PAGEZERO
-            (kSegCmd + 2 * kSect) + // __TEXT
-            (kSegCmd + 1 * kSect) + // __DATA
-            kSegCmd + // __LINKEDIT
-            kThreadCmd;
+        const uint32_t kSegments = kSegCmd + (kSegCmd + 2 * kSect) + (kSegCmd + 1 * kSect) + kSegCmd;
+        const char* kDylinker = "/usr/lib/dyld";
+        const char* kLibSystem = "/usr/lib/libSystem.B.dylib";
+        const uint32_t kTailCmds = isArm
+            ? (16u + // LC_DYLD_CHAINED_FIXUPS
+               24u + // LC_SYMTAB
+               80u + // LC_DYSYMTAB
+               32u + // LC_LOAD_DYLINKER ("/usr/lib/dyld")
+               24u + // LC_UUID
+               24u + // LC_BUILD_VERSION
+               24u + // LC_MAIN
+               56u) // LC_LOAD_DYLIB ("/usr/lib/libSystem.B.dylib")
+            : 184u; // LC_UNIXTHREAD (x86_THREAD_STATE64)
+        const uint32_t kNCmds = isArm ? 12u : 5u;
+        const uint32_t sizeOfCmds = kSegments + kTailCmds;
         const uint64_t headerSize = 32 + sizeOfCmds;
 
         // 6. File/VA layout. Invariant: every segment's VA == kBase + its file offset,
@@ -1688,6 +1818,43 @@ namespace Rux {
 
         const uint64_t linkeditOff = dataOff + dataVMSize;
         const uint64_t linkeditVA = kBase + linkeditOff;
+
+        // For the arm64 dynamic binary, __LINKEDIT carries an (empty) chained-fixups
+        // blob plus a degenerate symbol/string table. dyld validates these even
+        // though the program imports nothing. `codesign` later appends the code
+        // signature to the end of this segment.
+        Buf linkeditBuf;
+        uint64_t chainedFixupsOff = 0, chainedFixupsSize = 0;
+        uint64_t symtabOff = 0, strtabOff = 0, strtabSize = 0;
+        if (isArm) {
+            chainedFixupsOff = linkeditOff;
+            // dyld_chained_fixups_header (no rebases, no imports).
+            WriteU32(linkeditBuf, 0); // fixups_version
+            WriteU32(linkeditBuf, 32); // starts_offset
+            WriteU32(linkeditBuf, 52); // imports_offset
+            WriteU32(linkeditBuf, 52); // symbols_offset
+            WriteU32(linkeditBuf, 0); // imports_count
+            WriteU32(linkeditBuf, 1); // imports_format = DYLD_CHAINED_IMPORT
+            WriteU32(linkeditBuf, 0); // symbols_format = uncompressed
+            WriteU32(linkeditBuf, 0); // pad to starts_offset (32)
+            // dyld_chained_starts_in_image: one entry per segment, all "no fixups".
+            WriteU32(linkeditBuf, 4); // seg_count (__PAGEZERO, __TEXT, __DATA, __LINKEDIT)
+            for (int i = 0; i < 4; ++i)
+                WriteU32(linkeditBuf, 0); // seg_info_offset[i] = 0
+            WriteU8(linkeditBuf, 0); // symbol-strings: leading NUL (offset 52)
+            while (linkeditBuf.size() % 8)
+                WriteU8(linkeditBuf, 0);
+            chainedFixupsSize = linkeditBuf.size();
+            // Degenerate symbol + string tables (zero symbols, "\0" string pool).
+            symtabOff = linkeditOff + linkeditBuf.size();
+            strtabOff = linkeditOff + linkeditBuf.size();
+            for (int i = 0; i < 4; ++i)
+                WriteU8(linkeditBuf, 0);
+            strtabSize = 4;
+            while (linkeditBuf.size() % 8)
+                WriteU8(linkeditBuf, 0);
+        }
+        const uint64_t linkeditFileSize = linkeditBuf.size();
 
         // 7. Symbol VAs (thunks + defined symbols).
         std::unordered_map<std::string, uint64_t> symMap;
@@ -1721,8 +1888,15 @@ namespace Rux {
                 Error("undefined symbol 'Main' — no entry point found");
                 return false;
             }
-            const uint64_t nextInst = textVA + kCallMainDisp + 4;
-            Patch32(textBuf, kCallMainDisp, static_cast<uint32_t>(it->second - nextInst));
+            if (isArm) {
+                const uint64_t blVA = textVA + kCallMainDisp;
+                const int64_t disp = static_cast<int64_t>(it->second - blVA) >> 2;
+                Patch32(textBuf, kCallMainDisp, 0x94000000u | (static_cast<uint32_t>(disp) & 0x03FFFFFFu));
+            }
+            else {
+                const uint64_t nextInst = textVA + kCallMainDisp + 4;
+                Patch32(textBuf, kCallMainDisp, static_cast<uint32_t>(it->second - nextInst));
+            }
         }
 
         // 8. Apply relocations (identical logic to LinkElf64, Mach-O VAs).
@@ -1794,6 +1968,39 @@ namespace Rux {
                     else if (reloc.type == RcuRelType::Abs32) {
                         if (patchAt + 4 > buf->size()) continue;
                         Patch32(*buf, patchAt, static_cast<uint32_t>(targetVA + reloc.addend));
+                    }
+                    // AArch64 instruction-field relocations: splice the resolved
+                    // displacement/address into the 32-bit instruction in place.
+                    else if (reloc.type == RcuRelType::Arm64Branch26) {
+                        if (patchAt + 4 > buf->size()) continue;
+                        const int64_t disp = static_cast<int64_t>(targetVA + reloc.addend - siteVA) >> 2;
+                        const uint32_t orig = static_cast<uint32_t>((*buf)[patchAt]) |
+                            (static_cast<uint32_t>((*buf)[patchAt + 1]) << 8) |
+                            (static_cast<uint32_t>((*buf)[patchAt + 2]) << 16) |
+                            (static_cast<uint32_t>((*buf)[patchAt + 3]) << 24);
+                        Patch32(*buf, patchAt, (orig & 0xFC000000u) | (static_cast<uint32_t>(disp) & 0x03FFFFFFu));
+                    }
+                    else if (reloc.type == RcuRelType::Arm64PageAdrp) {
+                        if (patchAt + 4 > buf->size()) continue;
+                        const uint64_t tPage = (targetVA + static_cast<uint64_t>(reloc.addend)) & ~0xFFFull;
+                        const uint64_t sPage = siteVA & ~0xFFFull;
+                        const int64_t pageDelta = static_cast<int64_t>(tPage - sPage) >> 12;
+                        const uint32_t immlo = static_cast<uint32_t>(pageDelta) & 0x3u;
+                        const uint32_t immhi = static_cast<uint32_t>(pageDelta >> 2) & 0x7FFFFu;
+                        const uint32_t orig = static_cast<uint32_t>((*buf)[patchAt]) |
+                            (static_cast<uint32_t>((*buf)[patchAt + 1]) << 8) |
+                            (static_cast<uint32_t>((*buf)[patchAt + 2]) << 16) |
+                            (static_cast<uint32_t>((*buf)[patchAt + 3]) << 24);
+                        Patch32(*buf, patchAt, (orig & 0x9F00001Fu) | (immlo << 29) | (immhi << 5));
+                    }
+                    else if (reloc.type == RcuRelType::Arm64AddLo12) {
+                        if (patchAt + 4 > buf->size()) continue;
+                        const uint32_t lo12 = static_cast<uint32_t>((targetVA + reloc.addend) & 0xFFF);
+                        const uint32_t orig = static_cast<uint32_t>((*buf)[patchAt]) |
+                            (static_cast<uint32_t>((*buf)[patchAt + 1]) << 8) |
+                            (static_cast<uint32_t>((*buf)[patchAt + 2]) << 16) |
+                            (static_cast<uint32_t>((*buf)[patchAt + 3]) << 24);
+                        Patch32(*buf, patchAt, (orig & 0xFFC003FFu) | (lo12 << 10));
                     }
                 }
             }
@@ -1887,26 +2094,89 @@ namespace Rux {
         WriteU32(lc, 0);
         WriteU32(lc, 0);
 
-        // __LINKEDIT (empty placeholder; codesign grows it and adds LC_CODE_SIGNATURE)
+        // __LINKEDIT. For arm64 it holds the dyld metadata built above (and codesign
+        // grows it); for x86-64 it is an empty placeholder.
         WriteU32(lc, 0x19);
         WriteU32(lc, kSegCmd);
         wSegName(lc, "__LINKEDIT");
         WriteU64(lc, linkeditVA);
         WriteU64(lc, kPage);
         WriteU64(lc, linkeditOff);
-        WriteU64(lc, 0); // filesize
+        WriteU64(lc, linkeditFileSize); // filesize
         WriteU32(lc, 0x01); // maxprot R
         WriteU32(lc, 0x01); // initprot R
         WriteU32(lc, 0);
         WriteU32(lc, 0);
 
-        // LC_UNIXTHREAD (x86_THREAD_STATE64): set entry rip, leave rsp 0 (kernel default stack)
-        WriteU32(lc, 0x05); // LC_UNIXTHREAD
-        WriteU32(lc, kThreadCmd);
-        WriteU32(lc, 4); // flavor x86_THREAD_STATE64
-        WriteU32(lc, 42); // count (21 uint64 registers = 42 uint32)
-        for (int reg = 0; reg < 21; ++reg)
-            WriteU64(lc, reg == 16 ? textVA : 0); // register 16 == rip == entry point
+        if (isArm) {
+            // A fixed-cmdsize name command: cmd, cmdsize, name-offset, then the
+            // NUL-terminated path zero-padded out to cmdsize.
+            const auto wNameCmd = [&](uint32_t cmd, uint32_t cmdsize, uint32_t nameOff, const char* name,
+                                      auto&& writePrefix) {
+                const size_t start = lc.size();
+                WriteU32(lc, cmd);
+                WriteU32(lc, cmdsize);
+                writePrefix(); // command-specific fields between cmdsize and the name
+                for (const char* p = name; *p; ++p)
+                    WriteU8(lc, static_cast<uint8_t>(*p));
+                while (lc.size() - start < cmdsize)
+                    WriteU8(lc, 0);
+                (void)nameOff;
+            };
+
+            // LC_DYLD_CHAINED_FIXUPS
+            WriteU32(lc, 0x80000034);
+            WriteU32(lc, 16);
+            WriteU32(lc, static_cast<uint32_t>(chainedFixupsOff));
+            WriteU32(lc, static_cast<uint32_t>(chainedFixupsSize));
+            // LC_SYMTAB
+            WriteU32(lc, 0x02);
+            WriteU32(lc, 24);
+            WriteU32(lc, static_cast<uint32_t>(symtabOff));
+            WriteU32(lc, 0); // nsyms
+            WriteU32(lc, static_cast<uint32_t>(strtabOff));
+            WriteU32(lc, static_cast<uint32_t>(strtabSize));
+            // LC_DYSYMTAB (all-empty)
+            WriteU32(lc, 0x0B);
+            WriteU32(lc, 80);
+            for (int i = 0; i < 18; ++i)
+                WriteU32(lc, 0);
+            // LC_LOAD_DYLINKER
+            wNameCmd(0x0E, 32, 12, kDylinker, [&] { WriteU32(lc, 12); });
+            // LC_UUID (fixed, deterministic)
+            WriteU32(lc, 0x1B);
+            WriteU32(lc, 24);
+            for (int i = 0; i < 16; ++i)
+                WriteU8(lc, static_cast<uint8_t>(0x52 ^ (i * 0x11))); // 'R'…
+            // LC_BUILD_VERSION (macOS 11.0, no tools)
+            WriteU32(lc, 0x32);
+            WriteU32(lc, 24);
+            WriteU32(lc, 1); // PLATFORM_MACOS
+            WriteU32(lc, (11u << 16)); // minos 11.0.0
+            WriteU32(lc, (11u << 16)); // sdk 11.0.0
+            WriteU32(lc, 0); // ntools
+            // LC_MAIN: entryoff is the file offset of the entry preamble.
+            WriteU32(lc, 0x80000028);
+            WriteU32(lc, 24);
+            WriteU64(lc, textOff); // entryoff
+            WriteU64(lc, 0); // stacksize (default)
+            // LC_LOAD_DYLIB(libSystem)
+            wNameCmd(0x0C, 56, 24, kLibSystem, [&] {
+                WriteU32(lc, 24); // name offset
+                WriteU32(lc, 0); // timestamp
+                WriteU32(lc, 0); // current_version
+                WriteU32(lc, 0); // compatibility_version
+            });
+        }
+        else {
+            // LC_UNIXTHREAD (x86_THREAD_STATE64): entry rip; kernel default stack.
+            WriteU32(lc, 0x05);
+            WriteU32(lc, 184);
+            WriteU32(lc, 4); // flavor x86_THREAD_STATE64
+            WriteU32(lc, 42); // count (21 uint64 registers = 42 uint32)
+            for (int reg = 0; reg < 21; ++reg)
+                WriteU64(lc, reg == 16 ? textVA : 0); // register 16 == rip == entry point
+        }
 
         if (lc.size() != sizeOfCmds) {
             Error("internal: Mach-O load-command size mismatch");
@@ -1937,12 +2207,15 @@ namespace Rux {
 
         Buf hdr;
         WriteU32(hdr, 0xFEEDFACF); // MH_MAGIC_64
-        WriteU32(hdr, 0x01000007); // CPU_TYPE_X86_64
-        WriteU32(hdr, 0x00000003); // CPU_SUBTYPE_X86_64_ALL
+        WriteU32(hdr, isArm ? 0x0100000Cu : 0x01000007u); // CPU_TYPE_ARM64 : CPU_TYPE_X86_64
+        WriteU32(hdr, isArm ? 0x00000000u : 0x00000003u); // CPU_SUBTYPE_ARM64_ALL : X86_64_ALL
         WriteU32(hdr, 2); // MH_EXECUTE
         WriteU32(hdr, kNCmds);
         WriteU32(hdr, sizeOfCmds);
-        WriteU32(hdr, 0x00000001); // MH_NOUNDEFS
+        // arm64: MH_NOUNDEFS | MH_DYLDLINK | MH_TWOLEVEL | MH_PIE. Apple Silicon
+        // requires PIE main executables; the generated code is fully PC-relative
+        // (ADRP/ADD/BL), so an image slide is harmless.
+        WriteU32(hdr, isArm ? 0x00200085u : 0x00000001u);
         WriteU32(hdr, 0); // reserved
         wBuf(hdr);
         wBuf(lc);
@@ -1953,6 +2226,7 @@ namespace Rux {
         padToOffset(dataOff);
         wBuf(mergedData);
         padToOffset(linkeditOff); // keep __LINKEDIT fileoff within the file
+        wBuf(linkeditBuf); // arm64 dyld metadata (empty for x86-64)
 
         out.close();
         if (!out) {

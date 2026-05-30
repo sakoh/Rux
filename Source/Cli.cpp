@@ -175,13 +175,18 @@ namespace Rux {
             return "windows-x64";
 #elif defined(__linux__) && (defined(__x86_64__) || defined(__amd64__))
             return "linux-x64";
+#elif defined(__APPLE__) && (defined(__aarch64__) || defined(_M_ARM64))
+            return "macos-arm64";
+#elif defined(__APPLE__) && (defined(__x86_64__) || defined(__amd64__))
+            return "macos-x64";
 #else
             return "unknown";
 #endif
         }
 
         [[nodiscard]] bool IsSupportedTargetTriple(const std::string_view target) {
-            return target == "linux-x64" || target == "windows-x64";
+            return target == "linux-x64" || target == "windows-x64" || target == "macos-arm64" ||
+                target == "macos-x64";
         }
 
         [[nodiscard]] std::string DependencyPackageName(const Dependency& dep) {
@@ -555,7 +560,7 @@ namespace Rux {
         std::string targetName = target.empty() ? HostTargetTriple() : std::string(target);
         if (!IsSupportedTargetTriple(targetName)) {
             std::print(stderr,
-                       "error: unsupported target '{}'; supported targets are linux-x64 and windows-x64\n",
+                       "error: unsupported target '{}'; supported targets are linux-x64, windows-x64, macos-arm64, and macos-x64\n",
                        targetName);
             return 1;
         }
@@ -2184,7 +2189,7 @@ namespace Rux {
             }
             else {
                 std::print(stderr,
-                           "error: unsupported target '{}'; supported targets are linux-x64 and windows-x64\n",
+                           "error: unsupported target '{}'; supported targets are linux-x64, windows-x64, macos-arm64, and macos-x64\n",
                            targetName);
             }
             return 1;

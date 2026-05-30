@@ -55,8 +55,20 @@ namespace Rux {
         constexpr uint16_t None = 0;
         constexpr uint16_t Abs64 = 1;
         constexpr uint16_t Abs32 = 2;
-        constexpr uint16_t Rel32 = 3;
+        constexpr uint16_t Rel32 = 3; // x86-64: 4-byte PC-relative (call/lea rip)
+        // AArch64 instruction-field relocations. The site points at the 32-bit
+        // instruction word to patch; the linker splices the resolved address (or
+        // PC-relative displacement) into the instruction's immediate field.
+        constexpr uint16_t Arm64Branch26 = 4; // BL/B   imm26 = (target - site) >> 2
+        constexpr uint16_t Arm64PageAdrp = 5; // ADRP   imm21 = page(target) - page(site)
+        constexpr uint16_t Arm64AddLo12 = 6; // ADD    imm12 = target & 0xFFF
     } // namespace RcuRelType
+
+    // RcuFile::arch values
+    namespace RcuArch {
+        constexpr uint8_t X86_64 = 0x01;
+        constexpr uint8_t Arm64 = 0x02;
+    } // namespace RcuArch
 
     constexpr uint16_t RCU_SEC_EXTERNAL = 0xFFFF;
     constexpr uint16_t RCU_SEC_ABSOLUTE = 0xFFFE;

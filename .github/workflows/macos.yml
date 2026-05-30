@@ -2,16 +2,15 @@ name: macOS
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
-    branches: [main]
+    branches: [main, dev]
 
 jobs:
   build-and-test:
-    # macos-14 is Apple Silicon (arm64). Rux emits x86-64 Mach-O executables,
-    # so the produced test binaries run through Rosetta 2 (installed below).
-    # (Intel macos-13 runners are scarce/being retired and queue indefinitely,
-    # so we don't gate CI on them; the Rosetta path exercises the same output.)
+    # macos-14 is Apple Silicon (arm64). Rux now emits native arm64 Mach-O
+    # executables, so the produced test binaries run directly on the host —
+    # no Rosetta 2 required.
     runs-on: macos-14
 
     steps:
@@ -20,9 +19,6 @@ jobs:
       # Rux's C++26 sources need a recent Clang; Apple's bundled clang is too old.
       - name: Install toolchain
         run: brew install llvm cmake ninja
-
-      - name: Install Rosetta 2
-        run: softwareupdate --install-rosetta --agree-to-license
 
       - name: Configure
         run: |
